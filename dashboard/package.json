@@ -1,0 +1,30 @@
+{
+  "name": "data-pipeline-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint src --ext .js,.jsx"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.23",
+    "recharts": "^2.12",
+    "react-force-graph-2d": "^1.25",
+    "@tanstack/react-query": "^5.40",
+    "axios": "^1.7",
+    "clsx": "^2.1",
+    "date-fns": "^3.6"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3",
+    "vite": "^5.2",
+    "eslint": "^8.57",
+    "eslint-plugin-react": "^7.34",
+    "eslint-plugin-react-hooks": "^4.6"
+  }
+}

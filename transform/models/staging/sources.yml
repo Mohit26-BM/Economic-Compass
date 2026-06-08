@@ -1,0 +1,15 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: raw
+    tables:
+      - name: economic_indicators
+        description: Raw economic observations ingested from the FRED API
+        columns:
+          - name: series_id
+            description: FRED series identifier (e.g. GDP, UNRATE)
+          - name: observation_date
+            description: Date of the observation
+          - name: value
+            description: Numeric value of the indicator
