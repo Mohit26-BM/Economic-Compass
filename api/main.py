@@ -36,10 +36,18 @@ def health():
     }
     try:
         con = duckdb.connect("./data/warehouse.duckdb", read_only=True)
-        schemas = con.execute("SHOW SCHEMAS").fetchall()
-        result["schemas"] = [s[0] for s in schemas]
-        tables = con.execute("SHOW ALL TABLES").fetchdf()
-        result["tables"] = tables[["schema_name","table_name"]].to_dict("records")
+        result["schemas"] = [r[0] for r in con.execute(
+            "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name"
+        ).fetchall()]
+        result["tables"] = [f"{r[0]}.{r[1]}" for r in con.execute(
+            "SELECT table_schema, table_name FROM information_schema.tables "
+            "WHERE table_schema NOT IN ('information_schema','pg_catalog') ORDER BY 1,2"
+        ).fetchall()]
+        try:
+            count = con.execute("SELECT COUNT(*) FROM raw.economic_indicators").fetchone()[0]
+            result["raw_row_count"] = count
+        except Exception as e2:
+            result["raw_table_error"] = str(e2)
         con.close()
     except Exception as e:
         result["db_error"] = traceback.format_exc()
