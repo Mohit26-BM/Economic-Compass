@@ -44,7 +44,7 @@ def predict(series_id: str, horizon_months: int = 12) -> list[dict]:
             seasonal="add",
             seasonal_periods=12,
             initialization_method="estimated",
-        ).fit(optimized=True, disp=False)
+        ).fit(optimized=True)
     except Exception:
         # Fall back to non-seasonal if not enough data
         model = ExponentialSmoothing(
@@ -52,7 +52,7 @@ def predict(series_id: str, horizon_months: int = 12) -> list[dict]:
             trend="add",
             seasonal=None,
             initialization_method="estimated",
-        ).fit(optimized=True, disp=False)
+        ).fit(optimized=True)
 
     fc = model.forecast(horizon_months)
     resid_std = float(model.resid.std())
