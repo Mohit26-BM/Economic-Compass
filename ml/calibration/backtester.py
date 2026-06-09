@@ -4,7 +4,6 @@ from pathlib import Path
 
 import duckdb
 import pandas as pd
-from prophet import Prophet
 
 ARTIFACTS = Path(os.environ.get("MODEL_ARTIFACTS_PATH", "./ml/artifacts"))
 
@@ -45,6 +44,8 @@ def calibrate_series(
         freq = "MS"
     else:
         freq = "QS"
+
+    from prophet import Prophet
 
     model = Prophet(
         yearly_seasonality=True,
