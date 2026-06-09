@@ -1,12 +1,4 @@
-(base) PS D:\MERN\data-pipeline-platform> python -m pipeline.flows.ingest_flow
->> 
-14:06:42.753 | INFO    | prefect - Starting temporary server on http://127.0.0.1:8450
-See https://docs.prefect.io/v3/concepts/server#how-to-guides for more information on running a dedicated Prefect server.
-14:07:21.619 | INFO    | Flow run 'sceptical-seagull' - Beginning flow run 'sceptical-seagull' for flow 'economic-data-ingestion'
-14:07:21.632 | INFO    | Flow run 'sceptical-seagull' - Starting ingestion for 7 series → ./data/warehouse.duckdb
-14:07:24.801 | INFO    | Task run 'fetch-fred-series-a0e' - Task run failed with exception: RetryError(<Future at 0x278f3ca9d30 state=finished raised KeyError>) - Retry 1/2 will start 30 second(s) from nowTraining rows: 940
-First forecast point: {'ds': Timestamp('2026-06-01 00:00:00'), 'yhat': 3.9314801435609583, 'yhat_lower': 1.3149255551903998, 'yhat_upper': 6.500159481862083}
-(base) PS D:\MERN\data-pipeline-platform> # Orchestration
+# Orchestration
 prefect>=2.19
 prefect-sqlalchemy>=0.4
 
@@ -17,16 +9,11 @@ duckdb>=1.0
 pandas>=2.2
 pyarrow>=16.0
 
-# ML & Forecasting
+# ML
 scikit-learn>=1.5
-prophet>=1.1
-lightgbm>=4.3
 joblib>=1.4
 statsmodels>=0.14
 scipy>=1.13
-
-# Drift Detection
-evidently>=0.4
 
 # API
 fastapi>=0.111
@@ -35,17 +22,16 @@ pydantic>=2.7
 pydantic-settings>=2.3
 
 # Data Sources
-httpx>=0.27          # async HTTP for FRED / external APIs
+httpx>=0.27
 fredapi>=0.5
 
 # Utilities
 python-dotenv>=1.0
 loguru>=0.7
-tenacity>=8.3        # retry logic for API calls
+tenacity>=8.3
 
 # Dev / Test
 pytest>=8.2
 pytest-asyncio>=0.23
 pytest-cov>=5.0
-ruff>=0.4
-httpx>=0.27          # also used as async test client
+httpx>=0.27
