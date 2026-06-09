@@ -27,10 +27,20 @@ app.include_router(analysis.router, prefix="/analysis", tags=["Analysis"])
 
 @app.get("/health")
 def health():
-    import os
-    return {
+    import os, duckdb, traceback
+    result = {
         "status": "ok",
         "cwd": os.getcwd(),
         "db_exists": os.path.exists("./data/warehouse.duckdb"),
         "artifacts_exist": os.path.exists("./ml/artifacts/recession_model.joblib"),
     }
+    try:
+        con = duckdb.connect("./data/warehouse.duckdb", read_only=True)
+        schemas = con.execute("SHOW SCHEMAS").fetchall()
+        result["schemas"] = [s[0] for s in schemas]
+        tables = con.execute("SHOW ALL TABLES").fetchdf()
+        result["tables"] = tables[["schema_name","table_name"]].to_dict("records")
+        con.close()
+    except Exception as e:
+        result["db_error"] = traceback.format_exc()
+    return result
