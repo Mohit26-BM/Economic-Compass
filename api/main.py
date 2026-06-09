@@ -27,4 +27,10 @@ app.include_router(analysis.router, prefix="/analysis", tags=["Analysis"])
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    import os
+    return {
+        "status": "ok",
+        "cwd": os.getcwd(),
+        "db_exists": os.path.exists("./data/warehouse.duckdb"),
+        "artifacts_exist": os.path.exists("./ml/artifacts/recession_model.joblib"),
+    }
