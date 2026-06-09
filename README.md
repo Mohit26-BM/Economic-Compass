@@ -522,31 +522,3 @@ FRED API
                                             ▼
                                RecessionPage.jsx (dashboard)
 ```
-
----
-
-## Interview Talking Points
-
-**On the pipeline architecture:**
-
-> "I built a full data engineering pipeline: Prefect orchestrates the ingestion from FRED, dbt handles staging and mart transformations in DuckDB, and FastAPI serves everything downstream. Each layer is independently testable — I can run dbt without the API, and I can call the API without the dashboard."
-
-**On the analytical models:**
-
-> "The project runs seven distinct analytical models on the same underlying data. They're not independent charts — they're interconnected. The Scenario Simulator demonstrates this directly: move one slider and the Taylor Rule, recession probability, conditions index, and regime all update simultaneously. That's the whole point of building a platform rather than a collection of notebooks."
-
-**On the Conditions Index design:**
-
-> "I used 10-year rolling z-scores rather than full-history z-scores because economic regimes are non-stationary. The 1970s inflation environment isn't comparable to today. A rolling window gives scores that are meaningful relative to the current regime, and I clip at ±3.5 to prevent single shocks like April 2020 from dominating the composite."
-
-**On the recession model calibration:**
-
-> "I measure the recession model with a Brier score, not just accuracy. A model that outputs 70% probability for every month would have OK accuracy but terrible calibration. Brier score penalises confident wrong predictions — which is what actually matters for a probability forecast."
-
-**On data lineage:**
-
-> "If a forecast looks wrong, I can trace it back through the lineage graph: the dashboard gets data from the API, which calls the model, which was trained on mart_indicator_trends, which was built from stg_economic_indicators, which came from raw.economic_indicators, which was fetched from FRED. If FRED silently changes how they report a series, the lineage tells me exactly which downstream models are affected."
-
-**On the Scenario Simulator:**
-
-> "The Simulator was a deliberate design choice to make the platform accessible to non-economists. 'What if inflation fell to 2%?' is a question anyone can ask. The answer — Taylor Rule says cut rates to X, recession probability drops to Y%, conditions move to Moderate Growth, the closest historical analogue is 1996 — turns abstract models into concrete, interpretable outputs. I also added a prominent limitation warning explaining that momentum features are held fixed, so a user can't over-interpret a single-point simulation as a precise forecast."
