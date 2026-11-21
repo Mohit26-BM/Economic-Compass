@@ -76,7 +76,7 @@ export default function SeriesPage() {
 
       <div style={{ marginBottom: "0.75rem", display: "flex", gap: "1rem", alignItems: "center" }}>
         <span style={{ fontSize: "0.85rem", color: "#6b7280" }}>
-          Showing last 120 observations + 12-month forecast with 95% confidence interval
+          Showing last 120 observations + 12-month trend extrapolation (Holt-Winters) with a 95% interval. This is not an economic forecast: it continues the recent trend and seasonal pattern.
         </span>
         <button
           className="btn-outline"
@@ -149,7 +149,7 @@ export default function SeriesPage() {
 
       {showCalibration && (
         <div style={{ marginTop: "1.5rem" }}>
-          <h3>Calibration Backtest (trained on data before 2023-01-01)</h3>
+          <h3>Calibration Backtest (rolling origin: refit every 6 months since 2012, forecast 12 months ahead)</h3>
           {calibError ? (
             <p className="note">
               No calibration data yet. Run <code>python calibrate_all.py</code> to generate it.
@@ -175,6 +175,17 @@ export default function SeriesPage() {
                   <span className="metric-label">MAPE</span>
                   <span className="metric-value">{calibration.mape.toFixed(2)}%</span>
                 </div>
+                {calibration.mae_vs_naive != null && (
+                  <div className="metric-chip">
+                    <span className="metric-label">Error vs "no change"</span>
+                    <span
+                      className="metric-value"
+                      style={{ color: calibration.mae_vs_naive < 1 ? "#16a34a" : "#dc2626" }}
+                    >
+                      {calibration.mae_vs_naive.toFixed(2)}×
+                    </span>
+                  </div>
+                )}
                 <div className="metric-chip">
                   <span className="metric-label">Test periods</span>
                   <span className="metric-value">{calibration.n_test}</span>
@@ -187,6 +198,13 @@ export default function SeriesPage() {
                   ? "Somewhat overconfident — CI is narrower than it should be for this series."
                   : "Overconfident — actual values frequently fall outside the predicted interval. Consider retraining on recent data only."}
               </p>
+              {calibration.mae_vs_naive != null && (
+                <p style={{ fontSize: "0.82rem", color: "#6b7280", marginBottom: "0.75rem" }}>
+                  {calibration.mae_vs_naive < 1
+                    ? "The forecast makes smaller errors than assuming the last value simply continues."
+                    : "The forecast makes LARGER errors than assuming the last value simply continues, so it adds no information for this series. Treat the line as a trend illustration only."}
+                </p>
+              )}
               <div className="chart-card">
                 <ResponsiveContainer width="100%" height={280}>
                   <ComposedChart data={calibData} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>

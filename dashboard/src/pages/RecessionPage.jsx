@@ -89,7 +89,7 @@ function OOSMetrics({ oos }) {
       </h3>
       <p style={{ fontSize: "0.82rem", color: "#6b7280", marginBottom: "1rem" }}>
         Tests cover three distinct recessions: 2001, 2008–09, and 2020.
-        AUC &gt;0.75 = genuinely useful signal. Brier &lt;0.15 = well-calibrated probabilities.
+        AUC &gt;0.75 = useful ranking of risky vs calm months. The model is trained on only three recessions, so its percentages are a risk score, not a calibrated probability: a Brier score near the base rate (0.148) means no better than always quoting the historical average.
       </p>
       <div className="metric-row">
         <div className="metric-chip">

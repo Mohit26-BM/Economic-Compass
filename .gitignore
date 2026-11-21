@@ -83,3 +83,10 @@ desktop.ini
 # Temporary / scratch files
 *.tmp
 *.bak
+
+# local-only: tests, working notes, AI-assistant files (code and README only go to GitHub)
+/tests/
+/_local/
+CLAUDE.md
+AGENTS.md
+.claude/

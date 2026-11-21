@@ -78,7 +78,7 @@ export default function TaylorPage() {
       <p className="page-subtitle">
         The Taylor Rule estimates where the Fed <em>should</em> set rates given inflation and
         the output gap. Two variants are shown: a <strong>backward-looking</strong> version
-        using current inflation and a <strong>forward-looking</strong> version using the
+        using current inflation and a <strong>smoothed</strong> version (not a true forecast) using the
         5-year rolling average of CPI as a proxy for medium-term inflation expectations.
         The gap between variants illustrates why economists can disagree while using the
         same formula.
@@ -108,7 +108,7 @@ export default function TaylorPage() {
         </div>
         {current.taylor_forward != null && (
           <div className="metric-chip">
-            <span className="metric-label">Forward-looking Taylor</span>
+            <span className="metric-label">Smoothed-inflation Taylor</span>
             <span className="metric-value" style={{ color: "#10b981" }}>
               {current.taylor_forward.toFixed(2)}%
             </span>
@@ -143,7 +143,7 @@ export default function TaylorPage() {
           <h3>Actual FEDFUNDS vs Taylor Rule Variants (1990–present)</h3>
           <p style={{ fontSize: "0.82rem", color: "#6b7280" }}>
             <strong style={{ color: "#f59e0b" }}>Orange dashed</strong> = backward-looking (current CPI).{" "}
-            {hasForward && <><strong style={{ color: "#10b981" }}>Green dashed</strong> = forward-looking (5yr CPI average, ≈ medium-term expectations).{" "}</>}
+            {hasForward && <><strong style={{ color: "#10b981" }}>Green dashed</strong> = smoothed inflation (5yr CPI average, a rough stand-in for expectations).{" "}</>}
             Orange shading = periods Fed was &gt;0.75pp below the backward-looking Taylor rate.
           </p>
         </div>
@@ -192,7 +192,7 @@ export default function TaylorPage() {
                 dot={false}
                 strokeWidth={1.5}
                 strokeDasharray="3 3"
-                name="Taylor (forward-looking)"
+                name="Taylor (smoothed)"
                 connectNulls={false}
               />
             )}
@@ -209,7 +209,7 @@ export default function TaylorPage() {
           if you believe the Fed should react to current conditions.
         </div>
         <div style={{ flex: 1, minWidth: 220 }}>
-          <strong>Forward-looking specification</strong><br />
+          <strong>Smoothed-inflation specification</strong><br />
           Uses a 5-year rolling CPI average − 0.5pp. Approximates medium-term inflation
           expectations — the Fed sets rates for where inflation will be in 12–18 months,
           not where it is today. Typically produces a rate 1–2pp lower during inflation spikes.
@@ -245,7 +245,7 @@ export default function TaylorPage() {
 
       <div className="note" style={{ marginTop: "1rem" }}>
         <strong>Formula:</strong> Taylor Rate = 2% (r*) + π + 0.5×(π − 2%) + 0.5×output gap.
-        Backward-looking: π = CPI YoY − 0.5pp. Forward-looking: π = 5yr rolling CPI avg − 0.5pp.
+        Backward-looking: π = CPI YoY − 0.5pp. Smoothed: π = 5yr rolling CPI avg − 0.5pp.
         Output gap: Hodrick-Prescott filter (λ=1600) on quarterly nominal GDP.
         The r* = 2% neutral rate is a fixed assumption; some estimates place it at 0.5–1.5% post-GFC,
         which would lower both implied rates by 0.5–1.5pp.

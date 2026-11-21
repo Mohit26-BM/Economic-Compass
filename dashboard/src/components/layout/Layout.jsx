@@ -130,7 +130,7 @@ export default function Layout() {
         </nav>
         <div className="sidebar-footer">
           <div className="sidebar-footer-text">FRED API · dbt · DuckDB</div>
-          <div className="sidebar-footer-text">Prophet · scikit-learn</div>
+          <div className="sidebar-footer-text">statsmodels · scikit-learn</div>
         </div>
       </aside>
       <main className="content">

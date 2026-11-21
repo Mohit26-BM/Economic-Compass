@@ -26,7 +26,7 @@ async def ingest_economic_data(
     for series_id in targets:
         try:
             observations = await task_fetch_series(series_id)
-            result = task_load_observations(observations, db)
+            result = task_load_observations(observations, db, series_id)
         except Exception as e:
             logger.error(f"Failed to ingest {series_id}: {e}")
             from ingestion.schemas.raw import IngestionResult
@@ -42,4 +42,11 @@ async def ingest_economic_data(
 
 
 if __name__ == "__main__":
-    asyncio.run(ingest_economic_data())
+    import sys
+
+    outcome = asyncio.run(ingest_economic_data())
+    failed = [r.series_id for r in outcome if r.status != "success"]
+    if failed:
+        # A scheduler must be able to see that a run was incomplete.
+        print(f"FAILED or skipped: {', '.join(failed)}")
+        sys.exit(1)

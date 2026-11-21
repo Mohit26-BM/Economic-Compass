@@ -20,6 +20,8 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from ml.cache import cached_on_files
+
 ARTIFACTS = Path(os.environ.get("MODEL_ARTIFACTS_PATH", "./ml/artifacts"))
 ROLLING_WINDOW = 120  # 10-year z-score window (same as conditions index)
 MIN_PERIODS = 36
@@ -27,13 +29,15 @@ MIN_PERIODS = 36
 # Taylor Rule constants
 NEUTRAL_RATE = 2.0
 INFLATION_TARGET = 2.0
-POTENTIAL_GDP_GROWTH = 2.5  # simplified; HP-filter not available for single point
+CPI_PCE_ADJUSTMENT = -0.5   # same CPI-to-PCE wedge as the Taylor Rule page
+NAIRU = 4.4                 # long-run unemployment rate (CBO)
+OKUN_COEFFICIENT = 2.0      # 1pp of unemployment above NAIRU ~ 2% of output below potential
 
 # Slider range definitions surfaced to the UI
 SLIDER_CONFIG = {
     "fedfunds":   {"label": "Fed Funds Rate",        "unit": "%",  "min": 0.0,  "max": 10.0, "step": 0.25},
     "cpi_yoy":    {"label": "CPI Inflation (YoY)",   "unit": "%",  "min": -2.0, "max": 12.0, "step": 0.1},
-    "gdp_yoy":    {"label": "GDP Growth (YoY)",      "unit": "%",  "min": -8.0, "max": 10.0, "step": 0.1},
+    "gdp_yoy":    {"label": "GDP Growth (YoY, nominal)",      "unit": "%",  "min": -8.0, "max": 10.0, "step": 0.1},
     "unrate":     {"label": "Unemployment Rate",     "unit": "%",  "min": 2.0,  "max": 12.0, "step": 0.1},
     "t10y2y":     {"label": "10Y–2Y Spread",         "unit": "pp", "min": -3.0, "max": 3.5,  "step": 0.05},
     "houst_yoy":  {"label": "Housing Starts (YoY)",  "unit": "%",  "min":-50.0, "max": 60.0, "step": 1.0},
@@ -45,7 +49,17 @@ SLIDER_CONFIG = {
 # Data loading helpers
 # ---------------------------------------------------------------------------
 
+@cached_on_files()
+def _load_monthly_cached(db_path: str) -> pd.DataFrame:
+    return _read_monthly(db_path)
+
+
 def _load_monthly(db_path: str) -> pd.DataFrame:
+    # A copy, so one scenario can never change the cached panel another request reads.
+    return _load_monthly_cached(db_path).copy()
+
+
+def _read_monthly(db_path: str) -> pd.DataFrame:
     con = duckdb.connect(db_path, read_only=True)
     df = con.execute("""
         SELECT series_id, observation_date, value
@@ -83,9 +97,12 @@ def _compute_taylor(inputs: dict) -> dict:
     cpi_yoy   = inputs["cpi_yoy"]
     gdp_yoy   = inputs["gdp_yoy"]
 
-    pi_gap      = cpi_yoy - INFLATION_TARGET
-    output_gap  = gdp_yoy - POTENTIAL_GDP_GROWTH
-    taylor_rate = NEUTRAL_RATE + cpi_yoy + 0.5 * pi_gap + 0.5 * output_gap
+    # A single point has no history for an HP filter, and "GDP growth minus 2.5%" is a growth
+    # gap, not an output-LEVEL gap. Okun's law turns the unemployment gap into a level gap.
+    pi         = cpi_yoy + CPI_PCE_ADJUSTMENT
+    pi_gap     = pi - INFLATION_TARGET
+    output_gap = -OKUN_COEFFICIENT * (inputs["unrate"] - NAIRU)
+    taylor_rate = NEUTRAL_RATE + pi + 0.5 * pi_gap + 0.5 * output_gap
     policy_gap  = fedfunds - taylor_rate
 
     if policy_gap > 1.0:
@@ -115,7 +132,7 @@ def _compute_taylor(inputs: dict) -> dict:
         "output_gap":  round(output_gap, 2),
         "signal":      signal,
         "explanation": explanation,
-        "note": "Output gap uses simplified GDP − 2.5% approximation (HP filter requires a full series)",
+        "note": "Same rule as the Taylor page, but the output gap comes from unemployment (Okun's law, NAIRU 4.4%) because one scenario has no history to filter.",
     }
 
 
@@ -140,6 +157,7 @@ def _compute_recession(inputs: dict, db_path: str) -> dict:
     feats = _build_features(monthly).dropna(subset=feature_cols)
 
     row = feats[feature_cols].iloc[-1].copy()
+    current = row.copy()
 
     # Override the level (spot) features the user has set
     override_map = {
@@ -152,6 +170,23 @@ def _compute_recession(inputs: dict, db_path: str) -> dict:
     for col, val in override_map.items():
         if col in row.index and val is not None:
             row[col] = float(val)
+
+    # Momentum features describe how far each series moved recently. If the scenario moves a level,
+    # assume the move happened inside those windows, so a jump in unemployment to 8% also shows up
+    # as a rise in its 3- and 6-month change. (Leaving the old changes in place made the model see
+    # "unemployment 8%, and flat for six months", which no recession looks like.)
+    def shift_by(level_col, change_cols):
+        if level_col in row.index and override_map.get(level_col) is not None:
+            delta = float(row[level_col]) - float(current[level_col])
+            for c in change_cols:
+                if c in row.index:
+                    row[c] = float(current[c]) + delta
+
+    shift_by("unrate", ["unrate_3m_chg", "unrate_6m_chg"])
+    shift_by("fedfunds", ["fedfunds_6m_chg", "fedfunds_12m_chg"])
+    shift_by("t10y2y", ["t10y2y_3m_chg"])
+    if "t10y2y_inv_months" in row.index and inputs.get("t10y2y") is not None:
+        row["t10y2y_inv_months"] = 0.0 if inputs["t10y2y"] >= 0 else max(float(current["t10y2y_inv_months"]), 1.0)
 
     X_scaled = scaler.transform(row.values.reshape(1, -1))
     prob = float(model.predict_proba(X_scaled)[0, 1])
@@ -172,7 +207,8 @@ def _compute_recession(inputs: dict, db_path: str) -> dict:
     if fedfunds > 5.0:
         reasons.append(f"rates restrictive ({fedfunds:.1f}%)")
 
-    signal = "high" if prob > 0.65 else "medium" if prob > 0.35 else "low"
+    from ml.recession.model import SIGNAL_HIGH, SIGNAL_MEDIUM
+    signal = "high" if prob > SIGNAL_HIGH else "medium" if prob > SIGNAL_MEDIUM else "low"
     signal_color = {"high": "#dc2626", "medium": "#d97706", "low": "#16a34a"}[signal]
 
     return {
@@ -180,7 +216,7 @@ def _compute_recession(inputs: dict, db_path: str) -> dict:
         "signal":      signal,
         "signal_color": signal_color,
         "explanation": ". ".join(reasons) if reasons else "No strong recession signals from these inputs.",
-        "note": "Momentum features (3m/6m/12m changes) use current historical values; only level inputs are overridden.",
+        "note": "A move in a level is also applied to its 3/6/12-month change features (the move is assumed to have just happened); housing keeps its current momentum. A risk score from a model trained on three post-1976 recessions, not a forecast.",
     }
 
 
@@ -279,6 +315,13 @@ def _compute_conditions(inputs: dict, db_path: str) -> dict:
 # Historical analogues — top-N closest periods by Euclidean distance on z-scores
 # ---------------------------------------------------------------------------
 
+@cached_on_files()
+def _regime_map(db_path: str) -> dict:
+    """date -> regime label. Fitting K-means takes seconds, so it is done once per warehouse version."""
+    from ml.regime.detector import detect_regimes
+    return {r["date"]: r["regime"] for r in detect_regimes(db_path)["timeline"]}
+
+
 def _find_analogues(inputs: dict, db_path: str, n: int = 5) -> list[dict]:
     monthly    = _load_monthly(db_path)
     stationary = _make_stationary(monthly)
@@ -339,9 +382,7 @@ def _find_analogues(inputs: dict, db_path: str, n: int = 5) -> list[dict]:
 
     # Load regime labels for context
     try:
-        from ml.regime.detector import detect_regimes
-        regime_data = detect_regimes(db_path)
-        regime_map = {r["date"]: r["regime"] for r in regime_data["timeline"]}
+        regime_map = _regime_map(db_path)
     except Exception:
         regime_map = {}
 
@@ -381,12 +422,16 @@ def _find_analogues(inputs: dict, db_path: str, n: int = 5) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _classify_regime(inputs: dict) -> dict:
-    t10y2y   = inputs.get("t10y2y", 0.0)
-    unrate   = inputs.get("unrate", 4.5)
-    fedfunds = inputs.get("fedfunds", 4.0)
-    cpi_yoy  = inputs.get("cpi_yoy", 3.0)
-    gdp_yoy  = inputs.get("gdp_yoy", 2.5)
-    rsxfs_yoy = inputs.get("rsxfs_yoy", 3.0)
+    def val(key: str, default: float) -> float:
+        v = inputs.get(key)
+        return default if v is None else v
+
+    t10y2y    = val("t10y2y", 0.0)
+    unrate    = val("unrate", 4.5)
+    fedfunds  = val("fedfunds", 4.0)
+    cpi_yoy   = val("cpi_yoy", 3.0)
+    gdp_yoy   = val("gdp_yoy", 2.5)
+    rsxfs_yoy = val("rsxfs_yoy", 3.0)  # optional slider: a neutral value when it is left out
 
     # Tightening: two distinct cases —
     #   (a) elevated inflation + active hiking

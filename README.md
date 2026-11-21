@@ -1,524 +1,235 @@
 # Economic Compass
 
-An end-to-end data engineering and machine learning platform that ingests real U.S. macroeconomic data from the Federal Reserve (FRED API), transforms it through a dbt pipeline, runs seven analytical models, and serves everything through a FastAPI backend and React dashboard.
+A data engineering and analysis platform for U.S. macroeconomic data. It pulls nine series from the Federal Reserve (FRED), stores them in an embedded DuckDB warehouse, transforms them with dbt, runs seven analytical models, and serves everything through a read-only FastAPI backend and a React dashboard.
+
+It is built to show how the data and the models behave, and where they stop being reliable. Every model page carries its own caveats, and the [review section](#what-the-review-found-and-fixed) lists what was wrong and what changed.
+
+> **Not financial or economic advice.** The outputs are descriptive and educational. None of them is a forecast you should trade or plan around (see [Limitations](#limitations)).
 
 ---
 
-## What This Project Does
+## What it does
 
-Most portfolio projects stop at training a model in a notebook. This project builds the full production-grade stack around those models:
+- **Ingestion** — pulls nine FRED series (about 20,000 rows, some going back to 1854) with retries; each series is replaced in a single transaction, and an empty answer from FRED never wipes stored history.
+- **Transformation** — dbt staging view and a trends table (lags, rolling average, month-on-month and year-on-year change, lagged by date so quarterly and daily series are handled correctly).
+- **Seven analyses** — recession risk score, regime detection, Taylor Rule, Sahm Rule, conditions index, cross-series correlation and Granger tests, and a scenario simulator.
+- **Trend extrapolation** — a 12-month Holt-Winters projection per series, with a rolling-origin backtest that is compared against "nothing changes".
+- **Drift check** — population stability index (PSI) of each series' recent window against the previous five years.
+- **Lineage** — a graph of how data moves from FRED to each endpoint.
+- **Dashboard** — React pages for each of the above, with sliders and preset scenarios for the simulator.
 
-- **Automated ingestion** — pulls live economic data from the Federal Reserve on a schedule
-- **Data transformation** — cleans, types, and engineers features using dbt (the industry standard for SQL transformations)
-- **Seven analytical models** — recession probability, regime detection, Taylor Rule, Sahm Rule, correlation analysis, conditions index, and an interactive scenario simulator
-- **Data lineage** — tracks the full journey of every data point from API call to dashboard output
-- **REST API** — FastAPI backend serving all model outputs and historical data
-- **Interactive dashboard** — React frontend with charts, live what-if sliders, and historical analogue finder
+## Tech stack
 
----
+| Layer           | Technology                         | Purpose                                         |
+| --------------- | ---------------------------------- | ----------------------------------------------- |
+| Orchestration   | Prefect (2.19+)                    | Run and retry the ingestion flow                |
+| Warehouse       | DuckDB                             | Embedded analytical database, one file          |
+| Transformations | dbt + dbt-duckdb                   | Staging and trend models                        |
+| Models          | scikit-learn, statsmodels, SciPy   | Logistic regression, K-means, Holt-Winters, Granger |
+| API             | FastAPI + Uvicorn                  | Read-only JSON API with generated docs at `/docs` |
+| Dashboard       | React 18, Vite, Recharts, React Router 7 | Charts, sliders, lineage graph            |
+| Data source     | FRED API (St. Louis Fed)           | Free macroeconomic series                       |
 
-## Tech Stack
+## Series tracked
 
-| Layer           | Technology                          | Purpose                                           |
-| --------------- | ----------------------------------- | ------------------------------------------------- |
-| Orchestration   | Prefect 3                           | Schedule and monitor pipeline runs                |
-| Data warehouse  | DuckDB                              | Embedded analytical database (no server needed)   |
-| Transformations | dbt + dbt-duckdb                    | SQL-based data modeling (staging → marts)         |
-| ML models       | scikit-learn, Prophet, custom logic | Recession model, regime clustering, forecasting   |
-| API             | FastAPI + Uvicorn                   | Async REST API with auto-generated docs           |
-| Dashboard       | React + Vite + Recharts             | Interactive charts, sliders, lineage graph        |
-| Data source     | FRED API (St. Louis Fed)            | 800,000+ free macroeconomic series                |
+| Series ID | Name                          | Frequency | Used by                                            |
+| --------- | ----------------------------- | --------- | -------------------------------------------------- |
+| GDP       | Gross Domestic Product (**nominal**) | Quarterly | Taylor Rule, Conditions, Recession, Simulator |
+| CPIAUCSL  | Consumer Price Index          | Monthly   | Taylor Rule, Conditions, Recession, Simulator      |
+| UNRATE    | Unemployment Rate             | Monthly   | Sahm Rule, Recession, Conditions, Simulator        |
+| FEDFUNDS  | Federal Funds Rate            | Monthly   | Taylor Rule, Recession, Conditions, Simulator      |
+| T10Y2Y    | 10-Year minus 2-Year Treasury | Daily     | Recession, Conditions, Simulator                   |
+| HOUST     | Housing Starts                | Monthly   | Recession, Conditions, Simulator                   |
+| RSXFS     | Advance Retail Sales (ex-food services) | Monthly | Conditions, Simulator                    |
+| PAYEMS    | Nonfarm Payrolls              | Monthly   | Sahm chart, Conditions                             |
+| USREC     | NBER Recession Indicator      | Monthly   | Ground truth for validation only                   |
 
----
-
-## Project Structure
-
-```text
-data-pipeline-platform/
-├── ingestion/                      # Data ingestion layer
-│   ├── sources/
-│   │   └── fred.py                 # Async FRED API client with retry logic
-│   └── schemas/
-│       └── raw.py                  # Pydantic models for raw observations
-│
-├── pipeline/                       # Prefect orchestration
-│   ├── flows/
-│   │   └── ingest_flow.py          # Main ingestion flow (fetch → load)
-│   └── tasks/
-│       └── common.py               # Reusable Prefect tasks
-│
-├── transform/                      # dbt project
-│   ├── models/
-│   │   ├── staging/
-│   │   │   ├── sources.yml                    # DuckDB source definition
-│   │   │   └── stg_economic_indicators.sql    # Cleans raw data
-│   │   └── marts/
-│   │       └── mart_indicator_trends.sql      # Lag features + YoY/MoM %
-│   ├── dbt_project.yml
-│   └── profiles.yml
-│
-├── ml/                             # Machine learning layer
-│   ├── recession/
-│   │   └── model.py                # Logistic regression, OOS validation, Brier score
-│   ├── regime/
-│   │   └── detector.py             # K-means (k=4) regime clustering
-│   ├── taylor/
-│   │   └── rule.py                 # Taylor Rule (HP-filtered, forward/backward variants)
-│   ├── sahm/
-│   │   └── indicator.py            # Sahm Rule + accuracy metrics vs NBER
-│   ├── conditions/
-│   │   └── index.py                # 5-category conditions index (10yr rolling z-scores)
-│   ├── simulator/
-│   │   └── engine.py               # Scenario simulator engine + historical analogues
-│   ├── features/
-│   │   └── engineering.py          # Shared feature engineering (YoY transforms, etc.)
-│   ├── train/
-│   │   └── trainer.py              # Prophet training + artifact saving
-│   ├── inference/
-│   │   └── predictor.py            # Load artifact and generate forecasts
-│   └── artifacts/                  # Saved .joblib model files (gitignored)
-│
-├── monitoring/                     # Observability layer
-│   └── lineage/
-│       └── tracker.py              # Pipeline lineage graph (nodes + edges)
-│
-├── api/                            # FastAPI backend
-│   ├── main.py                     # App entry point + CORS config
-│   ├── routers/
-│   │   ├── pipeline.py             # GET /pipeline/series endpoints
-│   │   ├── metrics.py              # GET /metrics/forecast
-│   │   ├── lineage.py              # GET /lineage/graph
-│   │   └── analysis.py             # All analytical model endpoints
-│   └── schemas/
-│       └── responses.py            # Pydantic response models
-│
-├── dashboard/                      # React frontend (Vite)
-│   └── src/
-│       ├── pages/
-│       │   ├── OverviewPage.jsx        # Series cards + analysis tool index
-│       │   ├── SeriesPage.jsx          # Historical + forecast chart
-│       │   ├── LineagePage.jsx         # Interactive pipeline DAG
-│       │   ├── RecessionPage.jsx       # Recession probability gauge + history
-│       │   ├── RegimesPage.jsx         # K-means cluster chart + current regime
-│       │   ├── CorrelationPage.jsx     # Granger causality + cross-correlation matrix
-│       │   ├── TaylorPage.jsx          # Taylor Rule prescribed vs actual rate
-│       │   ├── SahmPage.jsx            # Sahm Rule chart + accuracy metrics
-│       │   ├── ConditionsPage.jsx      # Composite index + 5 category sub-indices
-│       │   └── SimulatorPage.jsx       # Interactive scenario simulator
-│       ├── services/
-│       │   └── api.js                  # Axios API client
-│       └── components/
-│           └── layout/Layout.jsx       # Collapsible sidebar navigation
-│
-├── data/
-│   ├── raw/                        # Gitignored
-│   └── processed/                  # Gitignored
-│
-├── docker/
-│   ├── api.Dockerfile
-│   └── dashboard.Dockerfile
-├── docker-compose.yml
-├── train_recession.py              # Train logistic regression recession model
-├── train_all.py                    # Train all Prophet forecast models
-├── requirements.txt
-├── pyproject.toml
-└── .env.example
-```
+Everything is put on a monthly grid first (quarterly GDP is carried forward up to three months, daily values are averaged within the month).
 
 ---
 
-## Economic Series Tracked
+## The analyses, and how far to trust each
 
-| Series ID | Full Name                            | Category        | Frequency | Use in models                                |
-| --------- | ------------------------------------ | --------------- | --------- | -------------------------------------------- |
-| GDP       | Gross Domestic Product               | Growth          | Quarterly | Taylor Rule, Conditions Index, Simulator     |
-| CPIAUCSL  | Consumer Price Index                 | Inflation       | Monthly   | Taylor Rule, Conditions Index, Simulator     |
-| UNRATE    | Unemployment Rate                    | Labour Market   | Monthly   | Sahm Rule, Recession model, Conditions Index |
-| FEDFUNDS  | Federal Funds Rate                   | Monetary Policy | Monthly   | Taylor Rule, Conditions Index, Simulator     |
-| T10Y2Y    | 10Y–2Y Treasury Spread               | Financial       | Daily     | Recession model, Conditions Index, Simulator |
-| HOUST     | New Housing Starts                   | Housing         | Monthly   | Conditions Index, Simulator                  |
-| RSXFS     | Advance Retail Sales (ex-food)       | Consumer        | Monthly   | Conditions Index, Simulator                  |
-| PAYEMS    | Nonfarm Payrolls                     | Labour Market   | Monthly   | Sahm Rule (payrolls YoY chart)               |
-| USREC     | NBER Recession Indicator             | Reference       | Monthly   | Ground truth for all model validation        |
+### 1. Recession risk score
 
-**Total: ~23,000 rows of real economic data spanning up to 80 years.**
+Logistic regression on 14 features (yield curve level, change and months inverted; unemployment level and 3/6-month change; Fed funds level and changes; housing; CPI and GDP growth). The target is whether the NBER indicator is 1 in **any of the next 12 months**.
 
----
+Validation is honest and the result is modest:
 
-## Data Pipeline Architecture
+| Out-of-sample test (trained to Dec 1999, tested 2001 onward, 12-month gap) | Result |
+| --- | --- |
+| AUC (ranking risky months above calm ones) | **0.84** |
+| Brier score vs always quoting the training base rate | 0.149 vs 0.148 (skill ≈ 0) |
+| 2001 recession | warned 3 months ahead |
+| 2008 recession | warned 12 months ahead |
+| 2020 recession | **missed** (a pandemic shock; nothing in these series foresaw it) |
+| False alarms (signal on, no recession within 12 months) | 3 (2006, 2022, 2024) |
 
-```text
-FRED API (9 series)
-   │
-   ▼  [Prefect Flow — ingest_flow.py]
-raw.economic_indicators               ← DuckDB raw schema, ~23k rows
-   │
-   ▼  [dbt — stg_economic_indicators.sql]
-main_staging.stg_economic_indicators  ← Cleaned: nulls removed, types cast, FRED
-                                         missing-value sentinel '.' → NULL
-   │
-   ▼  [dbt — mart_indicator_trends.sql]
-main_marts.mart_indicator_trends      ← Lag features (1m, 3m, 12m),
-                                         rolling 12m average, MoM/YoY % change
-   │
-   ├──▶ [ML Models]                   ← recession, regimes, Taylor, Sahm,
-   │                                     conditions, simulator, correlation
-   │
-   ├──▶ [Prophet Trainer]  →  ml/artifacts/*.joblib
-   │
-   └──▶ [Lineage Tracker]  →  nodes + edges graph
-              │
-              ▼
-         FastAPI (port 8000)
-              │
-              ▼
-         React Dashboard (port 5173)
-```
+What that means: the model ranks months by risk reasonably well, but its percentages are **not calibrated probabilities** and it was trained on only **three recessions** (1980, 1981–82, 1990; the yield-curve series starts in 1976). Treat the figure as a risk score. The regularisation strength was picked after looking at the 2001-onward results, so even these numbers are slightly flattering.
 
-### dbt Transformation Layers
+The history chart shows the production model fitted on all data, so it is in-sample.
 
-**Staging (`stg_economic_indicators`)** — materialised as a VIEW:
+### 2. Regime detection
 
-- Filters FRED missing values (`'.'` → NULL)
-- Casts `observation_date` to DATE, `value` to DOUBLE
-- Standardises column names across all series
-
-**Marts (`mart_indicator_trends`)** — materialised as a TABLE:
-
-- Lag features: `value_lag_1m`, `value_lag_3m`, `value_lag_12m`
-- Rolling 12-month average
-- Month-over-month % change (`mom_pct_change`)
-- Year-over-year % change (`yoy_pct_change`)
-
----
-
-## Data Lineage
-
-The platform tracks the complete transformation journey from FRED API call to dashboard output. Each node in the lineage graph has a `type` (source / transform / model / output) and each edge carries a `transform` label describing what happened at that step.
-
-```text
-FRED API
-  └─[fetch]──▶ raw.economic_indicators
-                  └─[dbt staging]──▶ stg_economic_indicators
-                                        └─[dbt mart]──▶ mart_indicator_trends
-                                                           │
-                                              ┌────────────┼────────────────────┐
-                                              ▼            ▼                    ▼
-                                        recession_    conditions_          taylor_rule
-                                        model         index                calculator
-                                              │            │                    │
-                                              └────────────┴──────────┬─────────┘
-                                                                       ▼
-                                                               React Dashboard
-```
-
-The lineage API endpoint (`GET /lineage/graph`) returns a node/edge JSON structure that the dashboard renders as an interactive DAG. Each series has its own lineage path — if FRED silently changes how it reports a series, the lineage graph immediately shows which downstream models are affected.
-
-**Why lineage matters for debugging:**
-
-1. Forecast looks wrong → check lineage to identify which transform step changed
-2. Conditions Index score unexpected → trace back through mart_indicator_trends to the raw series
-3. Regime label flipped → lineage shows whether the cause was a data issue or a model issue
-
----
-
-## Analytical Models
-
-### 1. Recession Probability
-
-Logistic regression trained on yield curve, unemployment momentum, and Fed Funds rate features. Outputs a 12-month forward recession probability.
-
-- **Validation:** Out-of-sample across three recessions (2001, 2008–09, 2020)
-- **Metric:** Brier score — measures calibration, not just directional accuracy
-- **Key feature:** T10Y2Y (yield curve inversion) — every U.S. recession since 1955 was preceded by an inverted yield curve
-
-### 2. Economic Regime Detection
-
-K-means clustering (k=4) on growth-rate transformed features. Identifies four recurring economic environments: Expansion, Tightening, Recession, Recovery.
-
-- Labels are validated against NBER recession dates
-- Silhouette score measures within-cluster cohesion
-- Current regime is identified by classifying the most recent data point
+K-means (k = 4) on growth rates and levels of nine series, labelled Expansion / Tightening / Recession / Recovery (an extreme cluster can be labelled Crisis). The recession cluster is **named using the NBER indicator**, so its overlap with NBER months is partly by construction. The model is fitted on the full history, which makes it a description of the past, not a real-time classifier.
 
 ### 3. Taylor Rule
 
-Classic Taylor Rule prescription using HP-filtered output gap and CPI inflation. Two variants:
+`rate = 2 + π + 0.5 (π − 2) + 0.5 × output gap`, the 1993 formula. Inflation is CPI less a fixed 0.5pp (a rough CPI-to-PCE adjustment). The output gap comes from a Hodrick-Prescott filter on CPI-deflated GDP. A second line uses 5-year average inflation; it is smoothed past inflation, **not** a forward-looking expectation.
 
-- **Backward-looking** — uses current CPI
-- **Forward-looking** — uses trailing 5-year CPI average (captures inflation expectations)
-
-The gap between the prescribed rate and the actual Fed Funds rate shows whether policy is tight or accommodative. When they diverge by more than 1pp, it's historically significant.
+Sanity checks the tests pin: the rule tracks the actual rate within 1pp in 2000 and 2007, and shows policy far below it in 1979 and 2021, which matches the usual reading of those episodes. See [Limitations](#limitations) for why it runs high today.
 
 ### 4. Sahm Rule
 
-The Sahm Rule fires when the 3-month average unemployment rate rises 0.5pp above its 12-month low. Designed by Claudia Sahm (former Fed economist) to identify recessions in real time using only publicly available data.
+The 3-month average unemployment rate minus its lowest value in the previous 12 months; at 0.5pp the rule signals a recession has started. It reproduces the published FRED value for August 2024 (0.57). Since 1970 it crossed the threshold 10 times: 8 coincided with an NBER recession and 2 did not (2003 and 2024). It is a **confirmation** tool; by design it fires after a recession has begun.
 
-**Accuracy metrics (validated vs NBER, since 1970):**
+### 5. Conditions index
 
-| Metric              | Value                                             |
-| ------------------- | ------------------------------------------------- |
-| Threshold crossings | Tracked per episode, not raw months               |
-| Correct signals     | Episodes overlapping ±3 months of NBER recession  |
-| False positives     | Episodes with no overlapping NBER recession       |
-| Payrolls YoY        | Supplementary chart showing momentum context      |
+Five categories (growth, labour, inflation, financial, housing), each a weighted average of 10-year rolling z-scores, averaged into a composite (clipped at ±3.5 so one shock month cannot dominate). Expansion months average +0.05 and NBER recession months −0.82. Because each reading is judged against the last ten years, a long-lasting shock gradually becomes the "normal" it is measured against.
 
-### 5. Conditions Index
+### 6. Correlation and Granger tests
 
-A composite index inspired by the Chicago Fed National Activity Index (CFNAI). Five category sub-indices — Growth, Labor Market, Inflation, Financial Conditions, Housing — each computed as a weighted average of 10-year rolling z-scores.
+Lagged correlations (either series may lead) on growth rates, plus Granger tests on **stationary** versions (YoY growth for trending series, first differences for rates), with a Bonferroni adjustment for choosing the best of six lags. Granger causality means "helps predict", not "causes", and monthly growth rates that overlap by eleven months overstate how independent the observations are. Read the p-values as a ranking.
 
-**Why 10-year rolling z-scores:**
-The 1970s–80s inflation and rate environment was structurally different from today. Using a rolling window means the score reflects conditions relative to the recent regime, not against historical extremes that are no longer comparable.
+### 7. Scenario simulator
 
-**Z-score clipping at ±3.5:**
-Prevents any single shock month (e.g. April 2020 COVID) from dominating the composite.
+Seven sliders feed all of the above for a hypothetical economy. Rules worth knowing: the Taylor rate uses the same formula as the Taylor page but takes its output gap from unemployment (Okun's law, NAIRU 4.4%); a change to a level (say unemployment) is also applied to that series' 3/6-month change features; the "closest historical months" compare the scenario against each past month's z-score; the regime label is a transparent rule, not the K-means model. The GDP slider is **nominal** growth. Presets are illustrative, not calibrated forecasts.
 
-| Composite Score | Label            |
-| --------------- | ---------------- |
-| < −1.0          | Contraction      |
-| −1.0 to −0.5    | Slowdown         |
-| −0.5 to −0.25   | Below Trend      |
-| −0.25 to +0.25  | Neutral          |
-| +0.25 to +0.75  | Moderate Growth  |
-| > +0.75         | Expansion        |
+### Trend extrapolation and its backtest
 
-**Validation:** In-sample separation — expansion months average ~+0.05, recession months average ~−0.84. A meaningful separation confirms the index discriminates between regimes.
+The series pages continue the last ten years' trend and seasonal pattern (Holt-Winters). Every six months since 2012 the model is refitted on what was known then, forecast 12 months ahead, and scored against what happened:
 
-### 6. Cross-Series Correlation
+| Series | 95% interval actually contained the outcome | Forecast error vs "nothing changes" |
+| --- | --- | --- |
+| GDP | 84% | 0.46× (better) |
+| CPI | 81% | 0.53× (better) |
+| Retail sales | 92% | 0.82× (better) |
+| Unemployment | 95% | 1.07× (no better) |
+| Housing starts | 99% | 1.01× (no better) |
+| Fed funds | 68% | 1.22× (worse) |
+| 10Y–2Y spread | 80% | 1.23× (worse) |
 
-Granger causality tests and lagged cross-correlations on growth-rate transformed series. Identifies which indicators statistically lead or lag others, with p-values.
-
-**Why growth-rate transforms:** Most economic series are non-stationary in levels (they trend upward over time). Applying YoY transforms makes them stationary, which is a prerequisite for valid Granger causality tests.
-
-### 7. Economic Scenario Simulator
-
-An interactive "macroeconomic laboratory" — seven sliders drive all models simultaneously.
-
-**Inputs (sliders):**
-
-| Slider         | Range                | Step   |
-| -------------- | -------------------- | ------ |
-| Fed Funds Rate | 0% to 10%            | 0.25pp |
-| CPI Inflation  | -2% to 12% (YoY)     | 0.1pp  |
-| GDP Growth     | -8% to 10% (YoY)     | 0.1pp  |
-| Unemployment   | 2% to 12%            | 0.1pp  |
-| 10Y-2Y Spread  | -3pp to +3.5pp       | 0.05pp |
-| Housing Starts | -50% to +60% (YoY)   | 1pp    |
-| Retail Sales   | -15% to +20% (YoY)   | 0.5pp  |
-
-**Outputs:**
-
-- Taylor Rule: prescribed vs actual rate, policy gap, plain-English explanation
-- Recession Risk: probability bar, signal color, reason
-- Conditions Index: composite label + 5 category chips
-- Economic Regime: rule-based label + explanation
-- Historical Analogues: top 5 closest real months by Euclidean distance in z-score space
-
-**Preset scenarios:** Soft Landing, Fed Pivot, 1970s Inflation, 2008 Crisis, COVID Shock, Goldilocks — clicking a preset moves all sliders to historically-calibrated values.
-
-**Scenario Interpretation panel:** Automatically generates a positive/negative signal breakdown and a plain-English net assessment for any combination of slider values.
-
-**Simulation limitation (prominently displayed):**
-Only current levels are adjusted. Historical momentum features (3m/6m/12m changes) remain anchored to actual data. Results are directional signals, not precise forecasts.
+For trending series the extrapolation helps; for rates and spreads, which turn on policy decisions, it adds nothing, and the dashboard says so next to each chart.
 
 ---
 
-## API Endpoints
+## What the review found and fixed
 
-Base URL: `http://localhost:8000`
+The platform was reviewed model by model against how each would be used in practice (check the numbers, then check whether they mean what the page says). Findings that changed behaviour:
 
-### Pipeline
+| Area | Problem | Real-life consequence | Fix |
+| --- | --- | --- | --- |
+| Recession target | The 12-month "forward" label was backward-looking (it was 0 in the year before the 2008 recession and 1 for months after it ended) | The model learned "a recession just happened" and its validation numbers were meaningless | Forward label; last 12 unlabelled months excluded; 12-month purge before the test period |
+| Recession validation | Only AUC and Brier were reported; no baseline | A Brier score near the base rate looked good | Baseline Brier, skill score, warning lead times and false alarms reported |
+| Sahm Rule | Used the lowest *monthly* unemployment rate instead of the lowest 3-month average of the previous 12 months | Missed the August 2024 trigger (0.47 vs the published 0.57) | Official definition; test pins the published value |
+| Granger tests | Run on raw levels, though the page said growth rates | Spurious "causal" links from shared trends | Stationary inputs, Bonferroni adjustment |
+| Cross-correlation | Only checked whether the first-listed series leads | "Fed funds leads unemployment" could not be found | Both directions searched |
+| Taylor Rule | HP filter on nominal GDP; 5-year trailing average called "forward-looking" | Steady inflation looked like a boom; the label overstated what the line is | CPI-deflated GDP; relabelled "smoothed" |
+| Simulator | Output gap = GDP growth − 2.5 (a growth gap, not a level gap); unemployment jumps left momentum features unchanged; optional sliders crashed the regime rule | Scenarios gave inconsistent or no answers | Okun gap, same PCE wedge as Taylor page, momentum pass-through, defaults for omitted sliders |
+| Regime | "GDP growth" was a 4-month change; analogue years listed every year in a range | Wrong feature, wrong analogues | 12-month growth; years that really had the regime |
+| Forecast calibration | Calibration measured Prophet; the API served Holt-Winters | The accuracy panel described a different model | One model; rolling-origin backtest vs a naive benchmark; Prophet removed |
+| dbt mart | Lags counted rows, not time | "12 rows back" was 3 years for GDP and 12 days for T10Y2Y | Lags by date (ASOF join) |
+| API | CORS `*` for everything, exception text returned to clients, `/health` listed the working directory and every table, unbounded parameters, the simulator accepted `NaN` and refitted K-means on every call | Information leak and an easy way to keep the server busy | See [Security](#security-and-reliability) |
+| Ingestion | Delete-then-insert without a transaction; empty FRED answer replaced a series with nothing; failures still exited 0 | A bad run could empty a series silently | Transactional replace, skip on empty, non-zero exit |
+| Docker | Dashboard image referenced a missing `nginx.conf`; `.env` could be copied into the image; an unused Postgres and Prefect server | Build failure and a secret-leak risk | Fixed, `.dockerignore`, non-root user, slimmer compose |
+| Dependencies | 14 npm advisories | Dev-server and router vulnerabilities | React Router 7 and Vite 8; `npm audit` reports 0 |
 
-| Method | Endpoint                | Description                                       |
-| ------ | ----------------------- | ------------------------------------------------- |
-| GET    | `/health`               | Health check                                      |
-| GET    | `/pipeline/series`      | List all 9 series with row counts and date ranges |
-| GET    | `/pipeline/series/{id}` | Historical observations for a single series       |
+## Security and reliability
 
-### Metrics
+- Public, read-only API with no logins or cookies. `ALLOWED_ORIGINS` can restrict browser access to your dashboard.
+- Every parameter is bounded and every series id is checked against the known list; scenario inputs must lie within the slider ranges and cannot be `NaN` or infinite.
+- Errors are logged in full and returned as short generic messages. `/health` only says whether the database and model exist.
+- Per-visitor rate limits (30 scenario runs and 120 reads per minute by default). `X-Forwarded-For` is trusted only when `TRUSTED_PROXY_HOPS` is set, so visitors cannot invent addresses to dodge the limit.
+- Analyses are cached until the warehouse or model file changes, and the heavy ones are warmed up in the background at start-up.
+- Security headers on API responses; the dashboard container runs nginx with the same headers. The API container runs as an unprivileged user.
 
-| Method | Endpoint                 | Description                                      |
-| ------ | ------------------------ | ------------------------------------------------ |
-| GET    | `/metrics/forecast/{id}` | 12-month Prophet forecast with confidence bounds |
+## API
 
-### Analysis
+Base URL `http://localhost:8000`, interactive docs at `/docs`.
 
-| Method | Endpoint                      | Description                                        |
-| ------ | ----------------------------- | -------------------------------------------------- |
-| GET    | `/analysis/recession`         | Recession probability + feature importance         |
-| GET    | `/analysis/regime`            | Current regime + cluster history                   |
-| GET    | `/analysis/taylor`            | Taylor Rule prescribed rate + policy gap history   |
-| GET    | `/analysis/sahm`              | Sahm Rule value + accuracy metrics vs NBER         |
-| GET    | `/analysis/correlation`       | Granger causality matrix + lagged correlations     |
-| GET    | `/analysis/conditions`        | Conditions index composite + 5 category scores     |
-| GET    | `/analysis/simulate-defaults` | Current real values for simulator slider init      |
-| POST   | `/analysis/simulate`          | Run all models against a hypothetical input set    |
-| GET    | `/analysis/calibration/{id}`  | Forecast calibration for a series                  |
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| GET | `/health` | Liveness, database and model present |
+| GET | `/pipeline/series`, `/pipeline/series/{id}?limit=` | Series list and recent observations |
+| GET | `/metrics/forecast/{id}?horizon=` | 12-month trend extrapolation (1–36) |
+| GET | `/metrics/drift`, `/metrics/drift/{id}` | PSI drift report |
+| GET | `/analysis/recession` `regime` `taylor` `sahm` `conditions` `correlation` | The six analyses |
+| GET | `/analysis/simulate-defaults` | Current values for the sliders |
+| POST | `/analysis/simulate` | Run all models on a scenario |
+| GET | `/analysis/calibration/{id}` | Forecast backtest results |
+| GET | `/lineage/graph` | Pipeline graph |
 
-### Lineage
+## Environment
 
-| Method | Endpoint         | Description                                   |
-| ------ | ---------------- | --------------------------------------------- |
-| GET    | `/lineage/graph` | Full pipeline lineage as nodes + edges JSON   |
-| GET    | `/docs`          | Auto-generated interactive API documentation  |
+Copy `.env.example` to `.env`. The committed warehouse already holds the data, so a key is only needed to refresh it.
 
----
+| Variable | Default | Used by | Notes |
+| --- | --- | --- | --- |
+| `FRED_API_KEY` | none | ingestion | Free key from FRED. Never sent anywhere else. |
+| `DUCKDB_PATH` | `./data/warehouse.duckdb` | everything | Warehouse file. |
+| `MODEL_ARTIFACTS_PATH` | `./ml/artifacts` | models, API | Trained model and backtest files. |
+| `ALLOWED_ORIGINS` | any site | API | Comma-separated list to restrict browser access. |
+| `TRUSTED_PROXY_HOPS` | `0` | API | Reverse proxies in front of the API (Render counts as 1). |
+| `SIMULATE_RATE_PER_MIN` / `READ_RATE_PER_MIN` | `30` / `120` | API | Per visitor. |
+| `WARMUP` | `1` | API | Set `0` to skip start-up pre-computation. |
+| `VITE_API_URL` | `http://localhost:8000` | dashboard (build time) | Address the browser uses to reach the API. |
 
-## Setup & Running
+## Running locally
 
-### Prerequisites
-
-- Python 3.11+
-- Node.js 20+
-- A free [FRED API key](https://fredaccount.stlouisfed.org/apikeys)
-
-### 1. Clone and install dependencies
+Python 3.11+ and Node 20+.
 
 ```bash
-git clone <repo-url>
-cd data-pipeline-platform
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # macOS/Linux
+python -m venv .venv && .venv\Scripts\activate        # source .venv/bin/activate on macOS/Linux
 pip install -r requirements.txt
+uvicorn api.main:app --port 8000                      # API (docs at /docs)
+
+cd dashboard && npm install && npm run dev             # dashboard at http://localhost:5173
 ```
 
-### 2. Configure environment
+Refreshing the data and models (needs `FRED_API_KEY`):
 
 ```bash
-cp .env.example .env
-# Edit .env and add your FRED_API_KEY
-```
-
-### 3. Run the ingestion pipeline
-
-```bash
-python -m pipeline.flows.ingest_flow
-```
-
-Fetches ~23,000 rows across 9 series into `data/warehouse.duckdb`.
-
-### 4. Run dbt transformations
-
-```bash
+python -m pipeline.flows.ingest_flow                   # fetch the nine series
 dbt run --project-dir transform --profiles-dir transform
+python train_recession.py                              # retrain the recession model
+python calibrate_all.py                                # recompute the forecast backtests (about a minute)
 ```
 
-Builds the staging view and marts table in DuckDB.
+Docker: `docker compose up --build` serves the API on 8000 and the dashboard on 5173. Set `TRUSTED_PROXY_HOPS` and `ALLOWED_ORIGINS` in `docker-compose.yml` when you put it behind a proxy.
 
-### 5. Train the recession model
+## Limitations
 
-```bash
-python train_recession.py
-```
+- **Revised data, not real-time data.** FRED returns today's revised values (GDP and payrolls are revised for years). Every historical result, including the validation above, is "what the data says now", not "what a forecaster knew then". A real-time study needs vintage data (ALFRED).
+- **GDP is nominal.** The warehouse holds nominal GDP, so "GDP growth" includes inflation. Real GDP (GDPC1) and CBO potential GDP would give a proper output gap.
+- **Publication lag.** GDP arrives about a month after the quarter, payrolls and unemployment a week after the month, and NBER dates a year or more later. The monthly panel lines series up by the period they describe, not by when they were published.
+- **Few recessions.** Only about twelve recessions since 1948 and three in the recession model's training period. Any model of recessions has very little to learn from.
+- **The Taylor Rule is a benchmark, not the Fed's rule.** It uses headline CPI, a 1993 neutral rate of 2% (modern estimates are about 0.5–1%) and an HP filter that is revised as data arrives. The gap it shows is context, not a prediction.
+- **The extrapolation is a trend, not a forecast.** It cannot anticipate a turning point and, for rates and spreads, does not beat "nothing changes".
+- **Single-country, monthly.** Nothing here covers other economies, daily markets, credit spreads, or surveys of expectations.
+- **In-memory rate limits.** Each API process counts separately and restarting resets them.
+- **No automated test suite in this repository.** The checks run during the review (79 tests across the models, API, ingestion and SQL) are kept outside the repository.
 
-Trains logistic regression on yield curve + labour market features. Saves to `ml/artifacts/recession_model.joblib`.
+## Possible improvements
 
-### 6. Train Prophet forecast models (optional)
+- Ingest vintage data (ALFRED) and rebuild the validation in real time.
+- Add real GDP (GDPC1), potential GDP (GDPPOT), core PCE and inflation-expectation series; use them in the Taylor Rule and the output gap.
+- Add credit spreads, initial claims and term-premium series to the recession model, and test a model that does not rely on levels from the 1980s.
+- Quantify uncertainty for the risk score (bootstrap or Bayesian) and show it on the page.
+- Replace the single-origin regime fit with a rolling or expanding fit so the label is available in real time.
+- Move the rate limit to a shared store; run ingestion on a schedule with alerting on failed series.
+- Schema tests in dbt (not-null, accepted series, freshness) and a freshness banner on the dashboard.
 
-```bash
-python train_all.py
-```
-
-Trains Prophet on all series (~30 seconds). Required only for the individual series forecast charts.
-
-### 7. Start the API
-
-```bash
-uvicorn api.main:app --reload --port 8000
-```
-
-API available at `http://localhost:8000`. Interactive docs at `http://localhost:8000/docs`.
-
-### 8. Start the dashboard
-
-```bash
-cd dashboard
-npm install
-npm run dev
-```
-
-Dashboard available at `http://localhost:5173`.
-
----
-
-## Key Engineering Decisions
-
-**Why DuckDB instead of PostgreSQL?**
-DuckDB is an embedded analytical database — it runs in-process with no server, stores data in a single file, and is optimised for columnar analytical queries. For a single-machine project it eliminates infrastructure overhead while still supporting full SQL, schemas, and dbt integration. The entire warehouse is a single `.duckdb` file.
-
-**Why Prefect instead of Airflow?**
-Prefect 3 has a much simpler local development experience — flows are just Python functions decorated with `@flow` and `@task`. No DAG configuration files, no XML, no scheduler process required. It runs in local mode automatically and provides observability for free.
-
-**Why logistic regression for recession prediction (not LSTM)?**
-Economic data is low-frequency (monthly), with limited labelled recession months (~80 since 1970). A logistic regression is interpretable, fast to retrain, and produces calibrated probability outputs. Deep learning would overfit on this sample size and produce opaque predictions. The Brier score measures calibration explicitly — probability outputs should actually reflect observed frequencies.
-
-**Why 10-year rolling z-scores for the Conditions Index?**
-The 1970s–80s was a structurally different economic regime (persistent high inflation, very different rate levels). Using full-history z-scores would make today's 3% CPI look "near normal" by comparison. A 10-year rolling window means the score reflects conditions relative to the recent regime — which is what's actually useful for a forward-looking decision.
-
-**Why rule-based regime classification in the Simulator?**
-The Simulator needs to classify a single hypothetical data point, not a time series. Re-running K-means on a single point would require the full historical panel as context. A rule-based classifier using explicit thresholds on inputs (CPI > 4% and Fed Funds > 3% → Tightening; GDP < 0 with 3+ stress signals → Recession; etc.) is deterministic, transparent, and avoids the chicken-and-egg problem of retraining.
-
----
-
-## Data Lineage in Detail
-
-The lineage tracker (`monitoring/lineage/tracker.py`) maintains a directed acyclic graph where:
-
-- **Nodes** represent data artifacts: raw tables, staging models, mart models, ML model outputs
-- **Edges** represent transformations: fetch, dbt-stage, dbt-mart, train, infer, aggregate
-
-The API serialises this graph as `{ nodes: [...], edges: [...] }` which the `LineagePage.jsx` dashboard renders as an interactive visualization.
-
-**Node schema:**
-
-```json
-{
-  "id": "mart_indicator_trends",
-  "label": "mart_indicator_trends",
-  "type": "transform",
-  "description": "Lag features, rolling averages, YoY/MoM changes"
-}
-```
-
-**Edge schema:**
-
-```json
-{
-  "source": "stg_economic_indicators",
-  "target": "mart_indicator_trends",
-  "transform": "dbt mart — adds lag_1m, lag_3m, lag_12m, rolling_12m_avg, mom_pct_change, yoy_pct_change"
-}
-```
-
-**Full lineage path for a recession probability output:**
+## Project layout
 
 ```text
-FRED API
-  └─[fetch via Prefect]──────────────▶ raw.economic_indicators
-                                            │
-                                  [dbt staging: type cast,
-                                   null filter, rename]
-                                            │
-                                            ▼
-                               stg_economic_indicators
-                                            │
-                                  [dbt mart: lag features,
-                                   rolling avg, YoY/MoM]
-                                            │
-                                            ▼
-                               mart_indicator_trends
-                                            │
-                              [feature engineering: inversion
-                               flag, momentum delta, spread]
-                                            │
-                                            ▼
-                               recession_model (logistic regression)
-                                            │
-                                 [inference: predict_proba]
-                                            │
-                                            ▼
-                               GET /analysis/recession
-                                            │
-                                            ▼
-                               RecessionPage.jsx (dashboard)
+ingestion/    FRED client and row schema
+pipeline/     Prefect flow and tasks (transactional load)
+transform/    dbt project (staging view, trends table)
+ml/           recession, regime, taylor, sahm, conditions, correlation, simulator,
+              inference (Holt-Winters), calibration (backtest), cache helper
+monitoring/   PSI drift detector, lineage graph
+api/          FastAPI app, routers, guards (limits, cache, safe errors)
+dashboard/    React app
+docker/       API and dashboard images
+data/         warehouse.duckdb (committed so the app runs without a key)
 ```

@@ -35,16 +35,16 @@ def _make_stationary(monthly: pd.DataFrame) -> pd.DataFrame:
 
     if "GDP" in monthly.columns:
         # GDP is quarterly forward-filled; pct_change(12) ≈ YoY growth on monthly data
-        out["GDP"] = monthly["GDP"].pct_change(12) * 100
+        out["GDP"] = monthly["GDP"].pct_change(12, fill_method=None) * 100
 
     if "CPIAUCSL" in monthly.columns:
-        out["CPIAUCSL"] = monthly["CPIAUCSL"].pct_change(12) * 100  # YoY inflation %
+        out["CPIAUCSL"] = monthly["CPIAUCSL"].pct_change(12, fill_method=None) * 100  # YoY inflation %
 
     if "RSXFS" in monthly.columns:
-        out["RSXFS"] = monthly["RSXFS"].pct_change(12) * 100  # YoY retail growth %
+        out["RSXFS"] = monthly["RSXFS"].pct_change(12, fill_method=None) * 100  # YoY retail growth %
 
     if "HOUST" in monthly.columns:
-        out["HOUST"] = monthly["HOUST"].pct_change(12) * 100  # YoY housing starts change %
+        out["HOUST"] = monthly["HOUST"].pct_change(12, fill_method=None) * 100  # YoY housing starts change %
 
     for s in ["FEDFUNDS", "UNRATE", "T10Y2Y"]:
         if s in monthly.columns:
@@ -75,10 +75,11 @@ def compute_cross_correlations(monthly: pd.DataFrame, max_lag: int = 12) -> list
     """
     Correlate stationary (growth-rate) versions of each series.
 
-    max_lag is intentionally capped at 12 months. Searching over 24 lags × 21 pairs
-    = 504 comparisons inflates apparent significance purely by chance. p-values
-    reported here are Pearson p at the chosen lag and are NOT Bonferroni-corrected
-    for the lag search — treat borderline values (p 0.01–0.05) with skepticism.
+    max_lag is intentionally capped at 12 months. Searching over 25 lags × 21 pairs
+    = 525 comparisons inflates apparent significance purely by chance. p-values
+    reported here are Pearson p at the chosen lag and are NOT corrected for the lag
+    search, and YoY growth rates overlap month to month (so the effective sample is far
+    smaller than the row count) — treat them as a ranking, not as hypothesis tests.
     """
     transformed = _make_stationary(monthly)
     series = [s for s in ANALYSIS_SERIES if s in transformed.columns]
@@ -91,21 +92,27 @@ def compute_cross_correlations(monthly: pd.DataFrame, max_lag: int = 12) -> list
             best_corr = 0.0
             best_lag = 0
             best_pval = 1.0
+            leader, follower = s1, s2
 
-            for lag in range(0, max_lag + 1):
-                shifted = transformed[s1].shift(lag)
-                combined = pd.DataFrame({"a": shifted, "b": transformed[s2]}).dropna()
-                if len(combined) < 30:
-                    continue
-                r, p = stats.pearsonr(combined["a"], combined["b"])
-                if not np.isnan(r) and abs(r) > abs(best_corr):
-                    best_corr = r
-                    best_lag = lag
-                    best_pval = p
+            # Either series may be the one that leads, so try both directions. (Only testing the
+            # first-listed series as leader could never find "the Fed funds rate leads unemployment"
+            # once unemployment happened to be listed first.)
+            for lead, follow in ((s1, s2), (s2, s1)):
+                for lag in range(0, max_lag + 1):
+                    if lag == 0 and lead == s2:
+                        continue  # lag 0 is symmetric; count it once
+                    shifted = transformed[lead].shift(lag)
+                    combined = pd.DataFrame({"a": shifted, "b": transformed[follow]}).dropna()
+                    if len(combined) < 30:
+                        continue
+                    r, p = stats.pearsonr(combined["a"], combined["b"])
+                    if not np.isnan(r) and abs(r) > abs(best_corr):
+                        best_corr, best_lag, best_pval = r, lag, p
+                        leader, follower = lead, follow
 
             results.append({
-                "series_a": s1,
-                "series_b": s2,
+                "series_a": leader,   # series_a leads series_b by best_lag months
+                "series_b": follower,
                 "best_lag": best_lag,
                 "correlation": round(best_corr, 4),
                 "p_value": round(float(best_pval), 6),
@@ -115,8 +122,25 @@ def compute_cross_correlations(monthly: pd.DataFrame, max_lag: int = 12) -> list
     return results
 
 
+def _granger_inputs(monthly: pd.DataFrame) -> pd.DataFrame:
+    """
+    Granger tests are only valid on stationary series. Trending series (CPI, housing) become YoY
+    growth; rate and spread series are first-differenced (their levels are close to unit roots).
+    The previous version tested raw levels, which produces spurious "causality" from shared trends.
+    """
+    out = pd.DataFrame(index=monthly.index)
+    for s in ("CPIAUCSL", "HOUST", "GDP", "RSXFS"):
+        if s in monthly.columns:
+            out[s] = monthly[s].pct_change(12, fill_method=None) * 100
+    for s in ("FEDFUNDS", "UNRATE", "T10Y2Y"):
+        if s in monthly.columns:
+            out[s] = monthly[s].diff()
+    return out
+
+
 def run_granger_tests(monthly: pd.DataFrame) -> list[dict]:
     results = []
+    monthly = _granger_inputs(monthly)
 
     for cause, effect in GRANGER_PAIRS:
         if cause not in monthly.columns or effect not in monthly.columns:
@@ -125,12 +149,14 @@ def run_granger_tests(monthly: pd.DataFrame) -> list[dict]:
         if len(data) < 60:
             continue
         try:
-            test_result = grangercausalitytests(data, maxlag=6, verbose=False)
+            test_result = grangercausalitytests(data, maxlag=6)
             best_lag = min(
                 test_result.keys(),
                 key=lambda k: test_result[k][0]["ssr_ftest"][1],
             )
             best_p = float(test_result[best_lag][0]["ssr_ftest"][1])
+            # We looked at 6 lags and pick the best, so the honest p-value is larger. Bonferroni.
+            best_p = min(1.0, best_p * 6)
 
             if best_p < 0.05:
                 interp = (

@@ -2,11 +2,13 @@ import os
 
 import duckdb
 import pandas as pd
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from loguru import logger
 
+from api.guards import FORECAST_SERIES, KNOWN_SERIES, public_error, rate_limit, read_limiter
 from monitoring.drift.detector import detect_drift
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(rate_limit(read_limiter))])
 
 ALL_SERIES = ["GDP", "CPIAUCSL", "UNRATE", "FEDFUNDS", "T10Y2Y", "HOUST", "RSXFS", "PAYEMS"]
 
@@ -77,7 +79,10 @@ def _split_windows(df: pd.DataFrame, reference_months: int, current_months: int)
 
 
 @router.get("/drift")
-def get_all_drift(reference_months: int = 60, current_months: int = 12):
+def get_all_drift(
+    reference_months: int = Query(60, ge=24, le=240),
+    current_months: int = Query(12, ge=3, le=60),
+):
     """PSI drift summary for all tracked series (stationary transforms, monthly resampled)."""
     results = []
     for sid in ALL_SERIES:
@@ -94,6 +99,7 @@ def get_all_drift(reference_months: int = 60, current_months: int = 12):
             result["transform_label"] = TRANSFORM_LABEL.get(sid, sid)
             results.append(result)
         except Exception:
+            logger.exception(f"Drift check failed for {sid}")
             continue
     return {
         "series":           results,
@@ -103,8 +109,14 @@ def get_all_drift(reference_months: int = 60, current_months: int = 12):
 
 
 @router.get("/drift/{series_id}")
-def get_drift_report(series_id: str, reference_months: int = 60, current_months: int = 12):
+def get_drift_report(
+    series_id: str,
+    reference_months: int = Query(60, ge=24, le=240),
+    current_months: int = Query(12, ge=3, le=60),
+):
     """PSI drift report for a single series."""
+    if series_id not in KNOWN_SERIES:
+        raise HTTPException(status_code=404, detail="Unknown series.")
     try:
         monthly    = _fetch_monthly(series_id)
         if monthly.empty:
@@ -118,15 +130,20 @@ def get_drift_report(series_id: str, reference_months: int = 60, current_months:
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise public_error(e, "Drift report")
 
 
 @router.get("/forecast/{series_id}")
-def get_forecast(series_id: str, horizon: int = 12):
+def get_forecast(series_id: str, horizon: int = Query(12, ge=1, le=36)):
+    """Trend-and-seasonality extrapolation (Holt-Winters), not an economic forecast. See /analysis/calibration."""
+    if series_id not in FORECAST_SERIES:
+        raise HTTPException(status_code=404, detail="Unknown series.")
     try:
         from ml.inference.predictor import predict
-        return {"series_id": series_id, "forecast": predict(series_id, horizon)}
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return {
+            "series_id": series_id,
+            "method": "Holt-Winters exponential smoothing on the last 10 years, additive trend and seasonality",
+            "forecast": predict(series_id, horizon),
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise public_error(e, "Forecast")

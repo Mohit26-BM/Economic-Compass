@@ -1,11 +1,11 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
-name = "data-pipeline-platform"
+name = "economic-compass"
 version = "0.1.0"
-description = "End-to-end data pipeline with drift detection and lineage tracking"
+description = "U.S. macroeconomic data pipeline, models, API and dashboard"
 requires-python = ">=3.11"
 
 [tool.setuptools.packages.find]

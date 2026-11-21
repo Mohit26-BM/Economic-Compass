@@ -21,6 +21,58 @@ ARTIFACTS = Path(os.environ.get("MODEL_ARTIFACTS_PATH", "./ml/artifacts"))
 # This covers three out-of-sample recession events: 2001, 2008-09, 2020.
 OOS_CUTOFF = "2001-01-01"
 
+# The model answers: "will the NBER recession indicator be 1 in any of the next 12 months?"
+HORIZON_MONTHS = 12
+
+# Signal bands used by the API and the simulator.
+SIGNAL_HIGH = 0.65
+SIGNAL_MEDIUM = 0.35
+
+
+def make_forward_target(usrec: pd.Series, known_until: pd.Timestamp, horizon: int = HORIZON_MONTHS) -> pd.Series:
+    """
+    1 if any of the NEXT `horizon` months (t+1 .. t+horizon) is a recession month, else 0.
+
+    Rows whose whole window is not yet observed (the last `horizon` months of data) are NaN,
+    never 0: "we do not know yet" is not the same as "no recession".
+    """
+    windows = pd.concat([usrec.shift(-k) for k in range(1, horizon + 1)], axis=1)
+    target = windows.max(axis=1, skipna=False)
+    last_complete = known_until - pd.DateOffset(months=horizon)
+    target[target.index > last_complete] = np.nan
+    return target
+
+
+def _episode_report(index: pd.DatetimeIndex, probs: np.ndarray, usrec: pd.Series, threshold: float) -> dict:
+    """
+    How the model behaves around real recessions, which is what a user of an early-warning
+    signal actually cares about: how early did it warn, and how often did it cry wolf?
+    """
+    s = pd.Series(probs, index=index)
+    rec = usrec.reindex(index).fillna(0)
+    starts = list(index[(rec.diff().fillna(rec.iloc[0]) == 1).values])
+
+    episodes = []
+    for start in starts:
+        window = s[(s.index >= start - pd.DateOffset(months=HORIZON_MONTHS)) & (s.index < start)]
+        above = window[window >= threshold]
+        episodes.append({
+            "recession_start": start.strftime("%Y-%m"),
+            "warned": bool(len(above)),
+            "lead_months": int(round((start - above.index[0]).days / 30.44)) if len(above) else None,
+            "peak_probability_before_start": round(float(window.max()), 4) if len(window) else None,
+        })
+
+    # A false alarm = the signal turns on and no recession starts within the next 12 months.
+    on = (s >= threshold).astype(int)
+    alarm_starts = list(s.index[(on.diff().fillna(on.iloc[0]) == 1).values])
+    false_alarms = []
+    for a in alarm_starts:
+        if not any(a <= st <= a + pd.DateOffset(months=HORIZON_MONTHS) for st in starts) and rec.get(a, 0) == 0:
+            false_alarms.append(a.strftime("%Y-%m"))
+
+    return {"threshold": threshold, "episodes": episodes, "false_alarm_starts": false_alarms}
+
 
 def _load_all_series(db_path: str = "./data/warehouse.duckdb") -> pd.DataFrame:
     con = duckdb.connect(db_path, read_only=True)
@@ -66,7 +118,7 @@ def _build_features(monthly: pd.DataFrame) -> pd.DataFrame:
         feats["houst_6m_pct"] = monthly["HOUST"].pct_change(6, fill_method=None) * 100
 
     if "CPIAUCSL" in monthly.columns:
-        feats["cpi_yoy"] = monthly["CPIAUCSL"].pct_change(12) * 100
+        feats["cpi_yoy"] = monthly["CPIAUCSL"].pct_change(12, fill_method=None) * 100
 
     if "GDP" in monthly.columns:
         feats["gdp_yoy"] = monthly["GDP"].pct_change(12, fill_method=None) * 100
@@ -74,7 +126,7 @@ def _build_features(monthly: pd.DataFrame) -> pd.DataFrame:
     return feats
 
 
-def _oos_metrics(model, scaler, X_test: np.ndarray, y_test: np.ndarray) -> dict:
+def _oos_metrics(model, scaler, X_test: np.ndarray, y_test: np.ndarray, y_train_mean: float) -> dict:
     """Compute out-of-sample metrics. Returns None values if no positives in test set."""
     if len(y_test) == 0 or y_test.sum() == 0:
         return {"auc": None, "brier": None, "precision": None, "recall": None, "f1": None}
@@ -83,9 +135,16 @@ def _oos_metrics(model, scaler, X_test: np.ndarray, y_test: np.ndarray) -> dict:
     probs = model.predict_proba(X_scaled)[:, 1]
     preds = (probs >= 0.5).astype(int)
 
+    brier = float(brier_score_loss(y_test, probs))
+    base_rate = float(y_train_mean)
+    brier_baseline = float(brier_score_loss(y_test, np.full(len(y_test), base_rate)))
     return {
         "auc": round(float(roc_auc_score(y_test, probs)), 4),
-        "brier": round(float(brier_score_loss(y_test, probs)), 4),
+        "brier": round(brier, 4),
+        # Brier score of always predicting the training base rate. A model is only useful
+        # if it beats this; skill > 0 means it does.
+        "brier_baseline": round(brier_baseline, 4),
+        "brier_skill": round(1 - brier / brier_baseline, 4) if brier_baseline > 0 else None,
         "precision": round(float(precision_score(y_test, preds, zero_division=0)), 4),
         "recall": round(float(recall_score(y_test, preds, zero_division=0)), 4),
         "f1": round(float(f1_score(y_test, preds, zero_division=0)), 4),
@@ -95,7 +154,14 @@ def _oos_metrics(model, scaler, X_test: np.ndarray, y_test: np.ndarray) -> dict:
     }
 
 
-def train_recession_model(db_path: str = "./data/warehouse.duckdb") -> dict:
+def _make_model(class_weight=None) -> LogisticRegression:
+    return LogisticRegression(C=0.1, class_weight=class_weight, max_iter=2000, random_state=42)
+
+
+def train_recession_model(db_path: str = "./data/warehouse.duckdb", class_weight="balanced") -> dict:
+    # class_weight="balanced" makes the model care about the rare recession months, so it warns
+    # earlier, at the price of probabilities that run higher than real frequencies. The output is
+    # therefore a risk SCORE ranked against history, not a calibrated probability (see README).
     df = _load_all_series(db_path)
 
     if "USREC" not in df["series_id"].unique():
@@ -105,17 +171,13 @@ def train_recession_model(db_path: str = "./data/warehouse.duckdb") -> dict:
 
     monthly = _to_monthly_panel(df)
     usrec = monthly["USREC"].fillna(0)
+    known_until = pd.Timestamp(df.loc[df["series_id"] == "USREC", "observation_date"].max())
 
     feats = _build_features(monthly)
     feats["recession_now"] = usrec.reindex(feats.index, method="ffill").fillna(0)
-    # Forward-looking target: any recession in the next 12 months
-    feats["target"] = (
-        usrec.reindex(feats.index, method="ffill")
-        .fillna(0)
-        .shift(-1)
-        .rolling(12, min_periods=1)
-        .max()
-    )
+    # Forward-looking target: any recession in the NEXT 12 months. Months whose window is not
+    # fully observed yet are NaN and are dropped from training (see make_forward_target).
+    feats["target"] = make_forward_target(usrec, known_until).reindex(feats.index)
     feats = feats.dropna()
 
     feature_cols = [c for c in feats.columns if c not in ("recession_now", "target")]
@@ -123,21 +185,32 @@ def train_recession_model(db_path: str = "./data/warehouse.duckdb") -> dict:
     y = feats["target"].values
 
     # --- Out-of-sample validation ---
-    split = feats.index < OOS_CUTOFF
-    X_train_v = X[split]
-    y_train_v = y[split]
-    X_test_v = X[~split]
-    y_test_v = y[~split]
+    # A row's label looks 12 months ahead, so rows in the 12 months before the cutoff have labels
+    # that already contain post-cutoff recession months. Leave them out of training (a "purge").
+    purge_edge = pd.Timestamp(OOS_CUTOFF) - pd.DateOffset(months=HORIZON_MONTHS)
+    train_mask = feats.index < purge_edge
+    test_mask = feats.index >= OOS_CUTOFF
+    X_train_v, y_train_v = X[train_mask], y[train_mask]
+    X_test_v, y_test_v = X[test_mask], y[test_mask]
 
     scaler_v = StandardScaler().fit(X_train_v)
-    model_v = LogisticRegression(C=0.5, class_weight="balanced", max_iter=1000, random_state=42)
+    model_v = _make_model(class_weight)
     model_v.fit(scaler_v.transform(X_train_v), y_train_v)
-    oos = _oos_metrics(model_v, scaler_v, X_test_v, y_test_v)
+    oos = _oos_metrics(model_v, scaler_v, X_test_v, y_test_v, float(y_train_v.mean()))
+    if len(y_test_v):
+        probs_test = model_v.predict_proba(scaler_v.transform(X_test_v))[:, 1]
+        oos["early_warning"] = _episode_report(
+            feats.index[test_mask], probs_test, usrec, SIGNAL_MEDIUM
+        )
+        oos["train_end"] = (purge_edge - pd.DateOffset(months=1)).strftime("%Y-%m")
+        oos["n_train"] = int(train_mask.sum())
+        oos["n_train_recession_episodes"] = int((usrec.reindex(feats.index[train_mask]).diff() == 1).sum())
+        oos["train_start"] = feats.index[train_mask][0].strftime("%Y-%m")
 
-    # --- Production model: train on all data ---
+    # --- Production model: train on all labelled data ---
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    model = LogisticRegression(C=0.5, class_weight="balanced", max_iter=1000, random_state=42)
+    model = _make_model(class_weight)
     model.fit(X_scaled, y)
 
     probs_full = model.predict_proba(X_scaled)[:, 1]
@@ -159,6 +232,8 @@ def train_recession_model(db_path: str = "./data/warehouse.duckdb") -> dict:
             "feature_cols": feature_cols,
             "oos_metrics": oos,
             "feature_importances": feature_importances,
+            "horizon_months": HORIZON_MONTHS,
+            "trained_through": feats.index[-1].strftime("%Y-%m"),
         },
         ARTIFACTS / "recession_model.joblib",
     )
@@ -222,10 +297,10 @@ def predict_recession(db_path: str = "./data/warehouse.duckdb") -> dict:
 
     current_features = {col: round(float(feats[col].iloc[-1]), 4) for col in feature_cols}
 
-    if current_prob > 0.65:
+    if current_prob > SIGNAL_HIGH:
         signal = "high"
         signal_label = f"High recession risk ({current_prob:.0%}) — yield curve and labour market data signal elevated probability"
-    elif current_prob > 0.35:
+    elif current_prob > SIGNAL_MEDIUM:
         signal = "medium"
         signal_label = f"Moderate recession risk ({current_prob:.0%}) — some leading indicators are deteriorating"
     else:

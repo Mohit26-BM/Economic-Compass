@@ -1,104 +1,123 @@
+"""
+Honest check of the forecasts the API actually serves (Holt-Winters, see ml/inference/predictor.py).
+
+A single train/test split says little with monthly data, so the backtest is a rolling origin: every
+6 months from 2012, fit on the data available at that date, forecast the next 12 months, and compare
+with what really happened. Results are reported overall and by horizon, next to a "nothing changes"
+benchmark. A forecast that cannot beat that benchmark is not adding information.
+"""
+
 import json
 import os
 from pathlib import Path
 
-import duckdb
+import numpy as np
 import pandas as pd
+
+from ml.inference.predictor import _load_series, forecast_series
 
 ARTIFACTS = Path(os.environ.get("MODEL_ARTIFACTS_PATH", "./ml/artifacts"))
 
-
-def _load_series(series_id: str, db_path: str = "./data/warehouse.duckdb") -> pd.DataFrame:
-    con = duckdb.connect(db_path, read_only=True)
-    df = con.execute("""
-        SELECT observation_date, value
-        FROM raw.economic_indicators
-        WHERE series_id = ? AND value IS NOT NULL
-        ORDER BY observation_date
-    """, [series_id]).fetchdf()
-    con.close()
-    df["ds"] = pd.to_datetime(df["observation_date"])
-    return df.rename(columns={"value": "y"})[["ds", "y"]].dropna()
+FIRST_ORIGIN = "2012-01-01"
+ORIGIN_STEP_MONTHS = 6
+HORIZON = 12
 
 
 def calibrate_series(
     series_id: str,
     cutoff_date: str = "2023-01-01",
     db_path: str = "./data/warehouse.duckdb",
+    write: bool = True,
 ) -> dict:
-    df = _load_series(series_id, db_path)
-    cutoff = pd.to_datetime(cutoff_date)
-    train = df[df["ds"] < cutoff].copy()
-    test = df[df["ds"] >= cutoff].copy()
+    """
+    cutoff_date is the origin shown in the dashboard chart. The coverage and error statistics come
+    from ALL origins.
+    """
+    s = _load_series(series_id, db_path)
+    if len(s) < 120:
+        raise ValueError(f"Only {len(s)} monthly observations (need at least 120)")
 
-    if len(train) < 24:
-        raise ValueError(f"Only {len(train)} training rows (need ≥24)")
-    if len(test) < 3:
-        raise ValueError(f"Only {len(test)} test rows")
-
-    # Detect frequency from median gap between observations
-    gaps = df["ds"].diff().dropna().dt.days.median()
-    if gaps <= 2:
-        freq = "D"
-    elif gaps <= 35:
-        freq = "MS"
-    else:
-        freq = "QS"
-
-    from prophet import Prophet
-
-    model = Prophet(
-        yearly_seasonality=True,
-        weekly_seasonality=False,
-        daily_seasonality=False,
-        interval_width=0.95,
-    )
-    model.fit(train)
-
-    future = model.make_future_dataframe(periods=len(test) + 12, freq=freq)
-    forecast = model.predict(future)
-
-    forecast_test = forecast[forecast["ds"].isin(test["ds"])][
-        ["ds", "yhat", "yhat_lower", "yhat_upper"]
+    last = s.index[-1]
+    origins = [
+        o for o in pd.date_range(FIRST_ORIGIN, last - pd.DateOffset(months=3), freq=f"{ORIGIN_STEP_MONTHS}MS")
+        if o <= last
     ]
-    merged = test.merge(forecast_test, on="ds")
+    if pd.Timestamp(cutoff_date) not in origins:
+        origins.append(pd.Timestamp(cutoff_date))
 
-    if len(merged) == 0:
-        raise ValueError("No overlap between forecast dates and test actuals")
+    rows = []
+    for origin in origins:
+        train = s[s.index < origin]
+        actual = s[s.index >= origin].iloc[:HORIZON]
+        if len(train) < 60 or actual.empty:
+            continue
+        fc = pd.DataFrame(forecast_series(train, HORIZON))
+        fc["ds"] = pd.to_datetime(fc["ds"])
+        fc = fc.set_index("ds")
+        naive = float(train.iloc[-1])
+        for h, (ds, y) in enumerate(actual.items(), start=1):
+            if ds not in fc.index:
+                continue
+            f = fc.loc[ds]
+            rows.append({
+                "origin": origin, "ds": ds, "h": h, "y": float(y), "yhat": float(f["yhat"]),
+                "lower": float(f["yhat_lower"]), "upper": float(f["yhat_upper"]), "naive": naive,
+            })
 
-    merged["in_interval"] = (
-        (merged["y"] >= merged["yhat_lower"]) & (merged["y"] <= merged["yhat_upper"])
-    )
-    coverage = float(merged["in_interval"].mean())
-    mae = float((merged["y"] - merged["yhat"]).abs().mean())
-    denom = merged["y"].abs().replace(0.0, float("nan"))
-    mape = float(((merged["y"] - merged["yhat"]).abs() / denom).mean() * 100)
+    if not rows:
+        raise ValueError("No overlap between forecasts and actuals")
 
-    calibration_data = []
-    for _, row in merged.iterrows():
-        calibration_data.append({
-            "ds": row["ds"].strftime("%Y-%m-%d"),
-            "actual": round(float(row["y"]), 4),
-            "forecast": round(float(row["yhat"]), 4),
-            "lower": round(float(row["yhat_lower"]), 4),
-            "upper": round(float(row["yhat_upper"]), 4),
-            "in_interval": bool(row["in_interval"]),
-        })
+    df = pd.DataFrame(rows)
+    df["in_interval"] = (df["y"] >= df["lower"]) & (df["y"] <= df["upper"])
+    df["abs_err"] = (df["y"] - df["yhat"]).abs()
+    df["naive_err"] = (df["y"] - df["naive"]).abs()
+
+    denom = df["y"].abs().replace(0.0, np.nan)
+    mape = float((df["abs_err"] / denom).mean() * 100)
+    mae = float(df["abs_err"].mean())
+    naive_mae = float(df["naive_err"].mean())
+
+    def band(lo: int, hi: int) -> dict:
+        d = df[(df["h"] >= lo) & (df["h"] <= hi)]
+        return {"coverage": round(float(d["in_interval"].mean()), 4), "n": int(len(d))} if len(d) else None
+
+    shown = df[df["origin"] == pd.Timestamp(cutoff_date)]
+    calibration_data = [
+        {
+            "ds": r["ds"].strftime("%Y-%m-%d"),
+            "actual": round(r["y"], 4),
+            "forecast": round(r["yhat"], 4),
+            "lower": round(r["lower"], 4),
+            "upper": round(r["upper"], 4),
+            "in_interval": bool(r["in_interval"]),
+        }
+        for _, r in shown.iterrows()
+    ]
 
     result = {
         "series_id": series_id,
+        "method": "Holt-Winters (as served), rolling-origin backtest",
         "cutoff_date": cutoff_date,
+        "first_origin": FIRST_ORIGIN,
+        "n_origins": int(df["origin"].nunique()),
         "expected_coverage": 0.95,
-        "actual_coverage": round(coverage, 4),
+        "actual_coverage": round(float(df["in_interval"].mean()), 4),
+        "coverage_by_horizon": {
+            "months_1_3": band(1, 3), "months_4_6": band(4, 6), "months_7_12": band(7, 12),
+        },
         "mae": round(mae, 4),
         "mape": round(mape, 4),
-        "n_test": len(merged),
+        "naive_mae": round(naive_mae, 4),
+        # < 1 means the forecast beat "nothing changes"; > 1 means it did worse.
+        "mae_vs_naive": round(mae / naive_mae, 4) if naive_mae > 0 else None,
+        "n_test": int(len(df)),
         "calibration_data": calibration_data,
     }
 
-    ARTIFACTS.mkdir(parents=True, exist_ok=True)
-    with open(ARTIFACTS / f"calibration_{series_id}.json", "w") as f:
-        json.dump(result, f)
+    if write:
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        with open(ARTIFACTS / f"calibration_{series_id}.json", "w") as f:
+            json.dump(result, f)
 
     return result
 

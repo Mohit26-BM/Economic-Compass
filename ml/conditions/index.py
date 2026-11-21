@@ -32,7 +32,7 @@ CATEGORIES = {
         "labels": ["Contracting", "Slowing", "Moderate", "Solid", "Robust"],
         "indicators": [
             {"series": "GDP",   "transform": "yoy", "invert": False, "weight": 1.2,
-             "label": "GDP growth (YoY)", "unit": "%"},
+             "label": "GDP growth (YoY, nominal)", "unit": "%"},
             {"series": "RSXFS", "transform": "yoy", "invert": False, "weight": 1.0,
              "label": "Retail Sales (YoY)", "unit": "%"},
         ],

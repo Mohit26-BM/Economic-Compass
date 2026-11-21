@@ -5,9 +5,13 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
-# Features are rates of change, not levels.
-# Levels create "era" clusters (1970s ≈ 2022 because both have high nominal CPI).
-# Change features capture economic dynamics: acceleration, contraction, pivot.
+# Price and activity series enter as rates of change, not levels (levels create "era" clusters:
+# the 1970s and 2022 both have a high CPI index). Unemployment, the policy rate and the yield
+# spread are already rates/spreads, so their levels are used alongside their changes.
+#
+# Limits worth knowing: the clustering is fitted on the full history (no real-time use), the
+# recession cluster is NAMED using the NBER indicator, so its overlap with NBER months is partly
+# by construction, and K-means treats monthly neighbours as independent points.
 REGIME_COLORS = {
     "Expansion": "#16a34a",
     "Tightening": "#d97706",
@@ -45,19 +49,18 @@ def _build_regime_features(monthly: pd.DataFrame) -> pd.DataFrame:
     feats = pd.DataFrame(index=monthly.index)
 
     if "CPIAUCSL" in monthly.columns:
-        feats["CPI_yoy"] = monthly["CPIAUCSL"].pct_change(12) * 100
+        feats["CPI_yoy"] = monthly["CPIAUCSL"].pct_change(12, fill_method=None) * 100
 
     if "GDP" in monthly.columns:
-        # GDP is quarterly — forward-filled, so pct_change(4) ≈ annual growth.
-        # fill_method=None avoids the pandas 2.2 deprecation warning; the monthly
-        # panel is already ffill-ed upstream so NaNs here are genuine gaps.
-        feats["GDP_growth"] = monthly["GDP"].pct_change(4, fill_method=None) * 100
+        # The panel is MONTHLY (quarterly GDP forward-filled), so 12 rows = one year.
+        # (pct_change(4) here used to measure a 4-month change, not annual growth.)
+        feats["GDP_growth"] = monthly["GDP"].pct_change(12, fill_method=None) * 100
 
     if "RSXFS" in monthly.columns:
-        feats["RSXFS_yoy"] = monthly["RSXFS"].pct_change(12) * 100
+        feats["RSXFS_yoy"] = monthly["RSXFS"].pct_change(12, fill_method=None) * 100
 
     if "HOUST" in monthly.columns:
-        feats["HOUST_yoy"] = monthly["HOUST"].pct_change(12) * 100
+        feats["HOUST_yoy"] = monthly["HOUST"].pct_change(12, fill_method=None) * 100
 
     if "UNRATE" in monthly.columns:
         # Level AND 3-month change — captures both current slack and acceleration
@@ -283,10 +286,9 @@ def detect_regimes(db_path: str = "./data/warehouse.duckdb", n_clusters: int = 4
         radar_data.append(row)
 
     recent_year = data.index[-1].year
-    same_regime_years = (
-        data[data["regime"] == current_regime]
-        .resample("YS").first().index.year.tolist()
-    )
+    # Years in which the current regime actually occurred (resample().first() used to list every
+    # calendar year in the range, including years that never had this regime).
+    same_regime_years = sorted(set(data.index[data["regime"] == current_regime].year.tolist()))
     analogues = [y for y in same_regime_years if y < recent_year - 2][-5:]
 
     usrec_validation = _usrec_cross_tab(data, monthly)

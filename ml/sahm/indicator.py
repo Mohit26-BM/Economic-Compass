@@ -29,10 +29,12 @@ def compute_sahm(db_path: str = "./data/warehouse.duckdb") -> dict:
 
     unrate = monthly["UNRATE"]
 
-    # Sahm Rule: 3-month avg UNRATE minus 12-month rolling minimum of UNRATE
-    # When this crosses +0.5pp, the rule signals a recession has started.
+    # Sahm Rule (Sahm, 2019): the 3-month average of the unemployment rate minus the LOWEST
+    # 3-month average seen in the PREVIOUS 12 months (this month excluded). Crossing +0.5pp
+    # signals that a recession has started. Checked against the published FRED series:
+    # Aug 2024 = 0.57. (Using the raw monthly minimum instead gives 0.47 and misses that trigger.)
     unrate_3m = unrate.rolling(3, min_periods=3).mean()
-    unrate_12m_min = unrate.rolling(12, min_periods=12).min()
+    unrate_12m_min = unrate_3m.shift(1).rolling(12, min_periods=12).min()
     sahm = (unrate_3m - unrate_12m_min).dropna()
 
     # Payrolls: month-over-month change (thousands of jobs) and 3-month avg

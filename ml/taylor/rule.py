@@ -3,7 +3,7 @@ import pandas as pd
 from statsmodels.tsa.filters.hp_filter import hpfilter
 
 TARGET_INFLATION = 2.0
-NEUTRAL_RATE = 2.0
+NEUTRAL_RATE = 2.0  # Taylor's original 2% real rate; modern estimates of r* are lower (~0.5-1%), so this rule runs high
 # CPI runs ~0.5–1pp above PCE (the Fed's actual target). A fixed -0.5pp
 # adjustment is a conservative approximation of the CPI-to-PCE wedge.
 # Historical range: 0.3–0.7pp. Source: BLS / BEA comparison studies.
@@ -35,17 +35,26 @@ def compute_taylor_rule(db_path: str = "./data/warehouse.duckdb") -> dict:
         raise ValueError("FEDFUNDS and CPIAUCSL required for Taylor Rule")
 
     # Backward-looking: actual recent CPI YoY adjusted toward PCE
-    pi_cpi = monthly["CPIAUCSL"].pct_change(12) * 100
+    pi_cpi = monthly["CPIAUCSL"].pct_change(12, fill_method=None) * 100
     pi_backward = pi_cpi + CPI_PCE_ADJUSTMENT
 
-    # Forward-looking proxy: 5-year rolling average of CPI YoY, PCE-adjusted.
+    # "Forward-looking" proxy (really a SMOOTHED trailing measure, not an expectation): 5-year
+    # rolling average of CPI YoY, PCE-adjusted. A true forward-looking variant needs survey or
+    # market expectations (SPF, Michigan, 5y5y breakevens), which are not ingested.
     # The Fed sets rates based on where inflation is heading (12-18 months ahead),
     # not where it is today. The 5-year rolling mean approximates medium-term
     # inflation expectations and dampens transitory spikes (e.g. 2021-22 surge).
     pi_forward = pi_cpi.rolling(60, min_periods=24).mean() + CPI_PCE_ADJUSTMENT
 
-    # Output gap via Hodrick-Prescott filter on quarterly nominal GDP (λ=1600)
-    gdp_monthly = monthly.get("GDP", pd.Series(dtype=float)).ffill()
+    # Output gap via Hodrick-Prescott filter (λ=1600) on quarterly REAL GDP.
+    # The warehouse holds nominal GDP, so it is deflated by CPI to approximate real GDP. (Running the
+    # filter on nominal GDP mixes price growth into the "gap": steady inflation looks like a boom.)
+    # CPI is a rougher deflator than the GDP price index; ingesting GDPC1 would be better.
+    gdp_nominal = monthly.get("GDP", pd.Series(dtype=float)).ffill()
+    if "CPIAUCSL" in monthly.columns:
+        gdp_monthly = gdp_nominal / monthly["CPIAUCSL"] * 100
+    else:
+        gdp_monthly = gdp_nominal
     gdp_q = gdp_monthly.resample("QS").last().dropna()
     if len(gdp_q) >= 16:
         _, gdp_trend_q = hpfilter(gdp_q, lamb=1600)
@@ -125,6 +134,12 @@ def compute_taylor_rule(db_path: str = "./data/warehouse.duckdb") -> dict:
         )
 
     return {
+        "caveats": [
+            "Uses headline CPI less a fixed 0.5pp, not core PCE, which is the Fed's own target measure.",
+            "Output gap is a CPI-deflated HP-filter estimate; the HP filter is two-sided, so the latest gap is revised as data arrives.",
+            "A fixed 2% neutral rate is the original 1993 value; current estimates are lower.",
+            "The Fed does not follow a rule mechanically. Read the gap as context, not a forecast of the next decision.",
+        ],
         "history":          history,
         "current":          current,
         "signal":           signal,
